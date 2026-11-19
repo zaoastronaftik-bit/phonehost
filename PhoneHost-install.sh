@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PhoneHost 0.2 • Debian on Termux, without flashing Android.
+# PhoneHost 0.2.1 • Debian on Termux, without flashing Android.
 set -euo pipefail
 umask 077
 
@@ -48,7 +48,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 INSTALL_SECONDS = 300
 PREFIX = Path(os.environ.get("PREFIX") or Path(__file__).resolve().parent.parent)
 STATE = Path.home() / ".phonehost"
@@ -356,6 +356,22 @@ fi
     return data
 
 
+def debian_install_command(log):
+    pd = binary("proot-distro")
+    result = subprocess.run([pd, "install", "--help"], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    help_text = "\n".join(clean(line) for line in result.stdout.splitlines())
+    with log.open("a", encoding="utf-8") as file:
+        file.write(f"\n--- proot-distro install --help (код {result.returncode}) ---\n{help_text}\n")
+    if result.returncode != 0:
+        raise UserError(f"Не удалось получить справку proot-distro (код {result.returncode}). Журнал: phonehost logs install.")
+    if re.search(r"(?<![\w-])--name\b", help_text):
+        return [pd, "install", "--name", CONTAINER, IMAGE]
+    if re.search(r"(?<![\w-])--override-alias\b", help_text):
+        return [pd, "install", "--override-alias", CONTAINER, "debian"]
+    raise UserError("В справке proot-distro не нашлись параметры имени контейнера. Журнал: phonehost logs install.")
+
+
 def install(opts):
     with serial():
         if rpc("status"):
@@ -371,16 +387,6 @@ def install(opts):
         ui.banner()
         ui.run(1, "Termux · обновляем списки пакетов", [binary("pkg"), "update", "-y"])
         ui.run(2, "Termux · PRoot и OpenSSH", [binary("pkg"), "install", "-y", "proot-distro", "openssh"])
-        pd = binary("proot-distro")
-        pd_help = subprocess.run([pd, "install", "--help"], capture_output=True, text=True)
-        if pd_help.returncode:
-            raise UserError(f"Не удалось запустить proot-distro: {clean(pd_help.stderr)}")
-        if re.search(r"(?<![\w-])--name\b", pd_help.stdout):
-            fetch = [pd, "install", "--name", CONTAINER, IMAGE]
-        elif "--override-alias" in pd_help.stdout:
-            fetch = [pd, "install", "--override-alias", CONTAINER, "debian"]
-        else:
-            raise UserError("Эта версия proot-distro не распознана. Обнови пакет в Termux.")
         exists = subprocess.run(guest("/usr/bin/test", "-r", "/etc/debian_version"),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         if exists:
@@ -388,7 +394,7 @@ def install(opts):
                 raise UserError("Среда phonehost уже существует и не принадлежит этому установщику.")
             ui.run(3, "Debian · используем уже установленную среду", guest("/bin/cat", "/etc/debian_version"))
         else:
-            ui.run(3, "Debian · скачиваем и распаковываем образ", fetch)
+            ui.run(3, "Debian · скачиваем и распаковываем образ", debian_install_command(ui.log))
             atomic_write(MARKER, "phonehost\n")
         ui.run(4, "Debian · индекс пакетов", guest("/usr/bin/apt-get", "update"))
         ui.run(5, "Debian · устанавливаем Nginx и сертификаты", guest("/bin/sh", "-s"), """set -eu
