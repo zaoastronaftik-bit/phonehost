@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PhoneHost 0.4 • Debian on Termux, without flashing Android.
+# PhoneHost 0.5 • Debian on Termux, without flashing Android.
 set -euo pipefail
 umask 077
 
@@ -25,7 +25,7 @@ cat >> "$launcher" <<'PHONEHOST_PY'
 import argparse
 import base64
 import binascii
-from collections import Counter
+from collections import Counter, deque
 import contextlib
 import fcntl
 import getpass
@@ -40,6 +40,8 @@ from pathlib import Path
 import queue
 import random
 import re
+import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -49,12 +51,12 @@ import subprocess
 import sys
 import threading
 import time
+import textwrap
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 INSTALL_SECONDS = 300
 PREFIX = Path(os.environ.get("PREFIX") or Path(__file__).resolve().parent.parent)
 STATE = Path.home() / ".phonehost"
@@ -204,7 +206,16 @@ def box_specs():
             for name, box in read_boxes().items() if box["ready"] and box["enabled"]}
 
 
-def box_setup_script(name, address, port):
+def box_setup_script(name, address, port, secret_hash=None):
+    if secret_hash is not None and not re.fullmatch(r"\$apr1\$[A-Za-z0-9./]{1,8}\$[A-Za-z0-9./]{22}", secret_hash):
+        raise UserError("Не удалось проверить формат хэша пароля.")
+    auth = '''auth_basic "PhoneHost";
+        auth_basic_user_file /opt/phonebox/htpasswd;''' if secret_hash else ""
+    credentials = f"""umask 077
+cat > /opt/phonebox/htpasswd <<'CREDENTIALS'
+host:{secret_hash}
+CREDENTIALS
+""" if secret_hash else ""
     return f"""set -eu
 if [ ! -x /usr/sbin/nginx ]; then
     own_policy=0
@@ -219,6 +230,7 @@ if [ ! -x /usr/sbin/nginx ]; then
     apt-get install -y --no-install-recommends nginx ca-certificates
 fi
 mkdir -p /opt/phonebox /srv/phonebox/www /run /var/lib/nginx
+{credentials}
 next=$(mktemp /opt/phonebox/.nginx.XXXXXX)
 cat > "$next" <<'NGINX'
 daemon off;
@@ -233,9 +245,10 @@ http {{
     server_tokens off;
     server {{
         listen {address}:{port};
+        {auth}
         root /srv/phonebox/www;
         index index.html;
-        location = {HEALTH} {{ return 200 "{HEALTH_BODY.decode()}"; }}
+        location = {HEALTH} {{ auth_basic off; return 200 "{HEALTH_BODY.decode()}"; }}
         location / {{ try_files $uri $uri/ =404; }}
     }}
 }}
@@ -249,7 +262,7 @@ fi
 """
 
 
-def manage_box(action, name=None):
+def manage_box(action, name=None, secret_hash=None):
     conf = read_config()
     if action == "list":
         boxes = read_boxes()
@@ -267,6 +280,8 @@ def manage_box(action, name=None):
         if action == "create":
             if box is not None and box["ready"]:
                 raise UserError(f"Коробка {name} уже существует.")
+            if box is not None and box.get("protected", False) != bool(secret_hash):
+                raise UserError("Повтори создание тем же способом: обычная коробка или быстрый сервер с паролем.")
             exists = subprocess.run(guest("/usr/bin/test", "-r", "/etc/debian_version", container=tag),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
             if box is None:
@@ -277,14 +292,14 @@ def manage_box(action, name=None):
                 if slot is None:
                     raise UserError("В пуле локальных адресов не осталось свободных мест.")
                 port = next(p for p in (8177, 8178, 8179) if p not in (conf["web_port"], conf["ssh_port"]))
-                box = {"slot": slot, "port": port, "ready": False, "enabled": False}
+                box = {"slot": slot, "port": port, "ready": False, "enabled": False, "protected": bool(secret_hash)}
                 port_free(port, box_ip(box))
                 boxes[name] = box
                 atomic_write(BOXES, json.dumps(boxes) + "\n")
             if not exists:
                 subprocess.run(debian_install_command(STATE / "install.log", tag), check=True)
             subprocess.run(guest("/bin/sh", "-s", container=tag),
-                           input=box_setup_script(name, box_ip(box), box["port"]), text=True, check=True)
+                           input=box_setup_script(name, box_ip(box), box["port"], secret_hash), text=True, check=True)
             box["ready"] = True
             atomic_write(BOXES, json.dumps(boxes) + "\n")
             print(f"Коробка {name} готова · http://{box_ip(box)}:{box['port']}")
@@ -310,6 +325,37 @@ def manage_box(action, name=None):
                 return
             time.sleep(0.35)
         raise UserError(f"Коробка не ответила. Посмотри phonehost logs box-{name}.")
+
+
+def quick_server(name=None):
+    read_config()
+    name = name or "quick-" + secrets.token_hex(3)
+    box_tag(name)
+    password = secrets.token_urlsafe(15)
+    generated = subprocess.run(guest("/usr/bin/openssl", "passwd", "-apr1", "-stdin"),
+                               input=password + "\n", text=True, capture_output=True, check=True, timeout=12)
+    digest = generated.stdout.strip()
+    if not re.fullmatch(r"\$apr1\$[A-Za-z0-9./]{1,8}\$[A-Za-z0-9./]{22}", digest):
+        raise UserError("OpenSSL не вернул хэш в ожидаемом формате.")
+    manage_box("create", name, secret_hash=digest)
+    box = read_boxes()[name]
+
+    def response(auth=None):
+        headers = {"Authorization": "Basic " + auth} if auth else {}
+        with contextlib.closing(http.client.HTTPConnection(box_ip(box), box["port"], timeout=3)) as conn:
+            conn.request("GET", "/", headers=headers)
+            return conn.getresponse().status
+
+    token = base64.b64encode(f"host:{password}".encode()).decode()
+    try:
+        manage_box("start", name)
+        if response() != 401 or response(token) != 200:
+            raise UserError("Проверка доступа не прошла. Быстрый сервер остановлен.")
+    except (UserError, OSError, http.client.HTTPException):
+        manage_box("stop", name)
+        raise
+    print(f"\nСервер  {name}\nАдрес   http://{box_ip(box)}:{box['port']}\nЛогин   host\nПароль  {password}")
+    print("Работает внутри телефона. Сохрани пароль: он показывается один раз.")
 
 
 def manage_service(action, name=None, script=None):
@@ -1293,6 +1339,126 @@ def local_network():
             print("Интерфейс: " + clean(fields[fields.index("dev") + 1]))
 
 
+IFACE_NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}"
+NEIGH_STATES = ("REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT", "NOARP")
+
+
+def system_probe(argv, root):
+    if root:
+        su = shutil.which("su") or ("/system/bin/su" if Path("/system/bin/su").is_file() else None)
+        if not su:
+            raise UserError("На этом Android не найден su.")
+        args = [su, "-c", shlex.join(argv)]
+    else:
+        args = argv
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", timeout=18)
+    if result.returncode or re.search(r"permission denial|permission denied|not permitted",
+                                      result.stdout[:256] + "\n" + result.stderr, re.I):
+        if not root:
+            raise UserError("Android не дал прочитать системные данные. Можно проверить из меню с root, если он есть.")
+        raise UserError("Android или менеджер root не дал прочитать системные данные.")
+    return result.stdout
+
+
+def selected_wifi_iface(routes):
+    for row in routes.splitlines():
+        fields = row.split()
+        if "dev" not in fields or fields.index("dev") + 1 >= len(fields):
+            continue
+        iface = fields[fields.index("dev") + 1]
+        if re.fullmatch(r"(?:wlan|swlan|wifi)\d{1,3}", iface):
+            return iface
+    return None
+
+
+def parse_neighbours(raw, iface):
+    rows = {}
+    for line in raw.splitlines():
+        fields = line.split()
+        if not fields or "lladdr" not in fields:
+            continue
+        if "dev" in fields:
+            at = fields.index("dev") + 1
+            if at >= len(fields) or fields[at] != iface:
+                continue
+        state = next((value for value in reversed(fields) if value in NEIGH_STATES), None)
+        if not state or any(value in fields for value in ("FAILED", "INCOMPLETE")):
+            continue
+        try:
+            ip = ipaddress.ip_address(fields[0].split("%", 1)[0])
+        except ValueError:
+            continue
+        if not (ip.is_loopback or ip.is_multicast or ip.is_unspecified):
+            rows[ip] = state
+    return sorted(rows.items(), key=lambda row: (row[0].version, int(row[0])))
+
+
+def parse_softap(dump):
+    matches = list(re.finditer(r"(?m)^[ \t]*Dump of SoftApManager(?:[ \t][^\r\n]*)?$", dump))
+    active = {}
+    for header in matches:
+        lines = []
+        for line in dump[header.end():].splitlines()[1:23]:
+            if re.match(r"^[ \t]*Dump of ", line):
+                break
+            lines.append(line)
+        block = "\n".join(lines)
+        iface = re.search(rf"(?m)^[ \t]*mApInterfaceName:[ \t]*({IFACE_NAME})[ \t]*$", block)
+        up = re.search(r"(?m)^[ \t]*mIfaceIsUp:[ \t]*true[ \t]*$", block)
+        if not iface or not up or iface[1] == "null":
+            continue
+        count = re.search(r"(?m)^[ \t]*getConnectedClientList\(\)\.size\(\):[ \t]*(\d{1,4})[ \t]*$", block)
+        active[iface[1]] = int(count[1]) if count else None
+    if active:
+        return "on", active
+    complete = all(marker in dump for marker in ("Dump of ActiveModeWarden", "NumActiveModeManagers:",
+                                                "STA + STA Concurrency Supported:"))
+    if complete and not matches:
+        return "off", {}
+    return "unknown", {}
+
+
+def print_neighbours(iface, root):
+    if not re.fullmatch(IFACE_NAME, iface):
+        raise UserError("Android вернул неизвестное имя интерфейса.")
+    rows = parse_neighbours(system_probe(["/system/bin/ip", "neigh", "show", "dev", iface], root), iface)
+    print(f"IP в кэше Android · {iface} · {len(rows)}")
+    for ip, state in rows:
+        print(f"  {str(ip):39} {state}")
+    if not rows:
+        print("Записей пока нет. Это не означает, что других устройств нет.")
+
+
+def network_inventory(mode, root=False):
+    if not Path("/system/bin").is_dir():
+        raise UserError("Системный инвентарь доступен в Termux на Android.")
+    if mode == "wifi":
+        routes = system_probe(["/system/bin/ip", "-4", "route", "get", "192.0.2.1"], root)
+        iface = selected_wifi_iface(routes)
+        if iface is None:
+            print("Android не показал Wi-Fi как активный маршрут. Проверь подключение или используй DHCP-таблицу своего роутера.")
+            return
+        print_neighbours(iface, root)
+        print("Пассивный просмотр кэша · записи могут быть устаревшими, полного списка нет.")
+        return
+    # The raw dump may contain Wi-Fi configuration; only parsed fields are displayed.
+    dump = system_probe(["/system/bin/dumpsys", "-t", "8", "wifi"], root)
+    state, active = parse_softap(dump)
+    if state == "off":
+        print("Точка доступа выключена. Включи «Мобильная точка доступа» в настройках Android и повтори проверку.")
+    elif state == "unknown":
+        print("Не удалось надёжно определить состояние точки. Проверь его в настройках Android.")
+    else:
+        print("Точка доступа включена.")
+        for iface, count in sorted(active.items()):
+            suffix = f" · подключено по данным Android: {count}" if count is not None else ""
+            print(f"Интерфейс: {iface}{suffix}")
+            if count != 0:
+                print_neighbours(iface, root)
+        print("Адреса взяты из кэша этой точки и могут покрывать не всех клиентов.")
+
+
 def recent_clients(path, limit=1500):
     counts, last = Counter(), {}
     try:
@@ -1419,6 +1585,28 @@ class MenuBack(Exception):
 
 
 class SharkConsole:
+    def __init__(self, root_network=False):
+        self.full = sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.color = self.full and "NO_COLOR" not in os.environ
+        self.root_network = root_network
+
+    def mode(self, enter):
+        if self.full:
+            print("\033[?1049h" if enter else "\033[?1049l", end="", flush=True)
+
+    def frame(self, title, lines, logo=False):
+        width, height = shutil.get_terminal_size((54, 24))
+        width = max(1, width - 1)
+        tint = "\033[38;5;80m" if self.color else ""
+        reset = "\033[0m" if tint else ""
+        if self.full:
+            print("\033[H\033[J", end="")
+        if logo and height >= 23 and width >= 41:
+            print(tint + SCYTHE.strip("\n") + reset)
+        print(f"{tint}◢━━◣  SHARK / PHONEHOST  {VERSION}{reset}")
+        print(tint + f"━━ {title} "[:width].ljust(width, "━") + reset)
+        print("\n".join(line[:width] for line in lines), flush=True)
+
     def prompt(self, label):
         value = input(f"  {label} › ").strip()
         if not value:
@@ -1426,37 +1614,126 @@ class SharkConsole:
         return value
 
     def pick(self, title, items, root=False):
+        notice = ""
         while True:
-            print(f"\n╭━━ {title} {'━' * max(2, 32 - len(title))}╮")
-            for index, (label, _) in enumerate(items, 1):
-                print(f"│ {index:2}. {label}")
-            print(f"│  0. {'Выход' if root else 'Назад'}")
-            print("╰" + "━" * 36 + "╯")
+            rows = [f" {index:2}. {label}" for index, (label, _) in enumerate(items, 1)]
+            rows.append(f"  0. {'Выход' if root else 'Назад'}")
+            if notice:
+                rows.append(notice)
+            self.frame(title, rows, logo=root)
+            notice = ""
             value = input("  SHARK › ").strip()
             if value == "0":
                 return
             if not value.isascii() or not value.isdecimal() or len(value) > 2 or not 1 <= int(value) <= len(items):
-                print("  Выбери номер из меню.")
+                notice = "  Выбери номер из меню."
                 continue
             try:
                 items[int(value) - 1][1]()
             except MenuBack:
                 pass
             except KeyboardInterrupt:
-                print("\n  Действие остановлено.")
+                self.result("Отменено", ("Действие остановлено.",), 130)
             except (UserError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-                print("  ! " + clean(str(exc)))
+                self.result("Ошибка", (clean(str(exc)),), 1)
+
+    def result(self, title, lines, code=0):
+        page = 0
+        while True:
+            width, height = shutil.get_terminal_size((54, 24))
+            width = max(8, width - 4)
+            stride = max(2, height - 7)
+            wrapped = [part for line in lines for part in textwrap.wrap(line, width) or [""]]
+            pages = max(1, (len(wrapped) + stride - 1) // stride)
+            page = min(page, pages - 1)
+            stamp = "Готово" if code == 0 else f"Код завершения: {code}"
+            controls = " ⏎ Назад" if pages == 1 else f" {page + 1}/{pages} · n дальше · p назад · Enter выход"
+            self.frame(title, [stamp, "", *wrapped[page * stride:(page + 1) * stride], "", controls])
+            key = input("  › ").strip().lower()
+            if key in ("n", ">") and page + 1 < pages:
+                page += 1
+            elif key in ("p", "<") and page > 0:
+                page -= 1
+            elif key in ("", "0", "q") or pages == 1:
+                return
+
+    def job(self, title, *args):
+        cmd = [sys.executable, "-u", str(Path(__file__).resolve()), *args]
+        with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                              errors="replace", start_new_session=True) as proc:
+            messages = queue.Queue()
+
+            def read():
+                try:
+                    for line in proc.stdout:
+                        messages.put(clean(line))
+                finally:
+                    messages.put(None)
+
+            reader = threading.Thread(target=read, daemon=True)
+            reader.start()
+            output = deque(maxlen=2000)
+            truncated = False
+            shown_at = -1.0
+            started = time.monotonic()
+            frames = ("▱▱▱▱▰", "▱▱▱▰▱", "▱▱▰▱▱", "▱▰▱▱▱", "▰▱▱▱▱")
+            try:
+                if not self.full:
+                    print(f"\n{title} · выполняется", flush=True)
+                while True:
+                    now = time.monotonic()
+                    if self.full and now - shown_at >= 0.20:
+                        recent = [line for line in list(output)[-4:] if not line.startswith("Пароль")]
+                        phase = frames[int((now - started) * 5) % len(frames)]
+                        self.frame(title, [f"{phase}  В работе · {int(now - started)} c", "",
+                                           *recent[-2:], "", "Ctrl+C — остановить"])
+                        shown_at = now
+                    try:
+                        line = messages.get(timeout=0.08)
+                    except queue.Empty:
+                        continue
+                    if line is None:
+                        break
+                    truncated |= len(output) == output.maxlen
+                    output.append(line)
+            except KeyboardInterrupt:
+                stop_children([proc])
+                raise
+            status = proc.wait()
+        results = list(output)
+        if truncated:
+            results.insert(0, "Показаны последние 2000 строк.")
+        self.result(title, results or ["Нет вывода."], status)
+
+    def open_box_shell(self):
+        name = self.prompt("Имя коробки")
+        self.mode(False)
+        try:
+            subprocess.run([sys.executable, str(Path(__file__).resolve()), "box", "shell", name], check=True)
+        finally:
+            self.mode(True)
 
     def path(self):
-        return Path(self.prompt("Путь к файлу")).expanduser()
+        return str(Path(self.prompt("Путь к файлу")).expanduser())
+
+    def inventory(self, mode):
+        title = "Текущий Wi-Fi" if mode == "wifi" else "Своя точка доступа"
+        if self.root_network:
+            return self.job(title, "network", mode, "--root")
+        self.pick(title, (
+            ("Посмотреть IP из кэша Android", lambda: self.job(title, "network", mode)),
+            ("Проверить с root, только чтение", lambda: self.job(title, "network", mode, "--root")),
+        ))
 
     def network(self):
         self.pick("IP / Локальная сеть", (
-            ("Мои адрес и шлюз", local_network),
-            ("Мой внешний IP", public_address),
-            ("Кто обращался к PhoneHost", show_clients),
-            ("Аренды DHCP своего роутера", lambda: show_leases(self.path())),
-            ("Калькулятор подсети", lambda: subnet_info(self.prompt("IP/маска, например 192.168.1.42/24"))),
+            ("Мои адрес и шлюз", lambda: self.job("Адрес и шлюз", "_console-view", "local")),
+            ("Мой внешний IP", lambda: self.job("Внешний IP", "_console-view", "public")),
+            ("Кто обращался к PhoneHost", lambda: self.job("Клиенты PhoneHost", "_console-view", "clients")),
+            ("Аренды DHCP своего роутера", lambda: self.job("Аренды DHCP", "_console-view", "leases", self.path())),
+            ("Калькулятор подсети", lambda: self.job("Подсеть", "_console-view", "subnet",
+                                                   self.prompt("IP/маска, например 192.168.1.42/24"))),
         ))
 
     def lookup(self):
@@ -1465,68 +1742,86 @@ class SharkConsole:
             kind = input("  Тип записи [A] › ").strip().upper() or "A"
             if kind not in DNS_TYPES:
                 raise UserError("Доступны " + ", ".join(DNS_TYPES))
-            toolbox(SimpleNamespace(action="dns", domain=domain, type=kind))
+            self.job("DNS", "toolbox", "dns", domain, "--type", kind)
         self.pick("DNS / Реестры / TLS", (
             ("Записи домена", dns),
-            ("Владелец диапазона публичного IP", lambda: rdap_lookup(self.prompt("Публичный IP"))),
-            ("Обратная DNS-запись", lambda: reverse_dns(self.prompt("Публичный IP"))),
-            ("Проверка TLS-сертификата", lambda: check_tls(self.prompt("Домен"))),
+            ("Владелец диапазона публичного IP", lambda: self.job("Регистрация IP", "toolbox", "rdap", self.prompt("Публичный IP"))),
+            ("Обратная DNS-запись", lambda: self.job("Обратный DNS", "_console-view", "reverse", self.prompt("Публичный IP"))),
+            ("Проверка TLS-сертификата", lambda: self.job("TLS", "_console-view", "tls", self.prompt("Домен"))),
         ))
 
     def files(self):
         self.pick("Анализ файлов", (
-            ("Отпечаток SHA-256", lambda: toolbox(SimpleNamespace(action="hash", path=self.path()))),
-            ("Распознать формат", lambda: inspect_file(self.path())),
-            ("Прочитать метаданные своего файла", lambda: inspect_file(self.path(), metadata=True)),
+            ("Отпечаток SHA-256", lambda: self.job("SHA-256", "toolbox", "hash", self.path())),
+            ("Распознать формат", lambda: self.job("Формат", "_console-view", "format", self.path())),
+            ("Прочитать метаданные своего файла", lambda: self.job("Метаданные", "_console-view", "metadata", self.path())),
         ))
 
     def services(self):
         self.pick("Мои проекты", (
-            ("Список служб", lambda: manage_service("list")),
-            ("Добавить службу", lambda: manage_service("add", self.prompt("Имя"),
+            ("Список служб", lambda: self.job("Службы", "service", "list")),
+            ("Добавить службу", lambda: self.job("Добавление", "service", "add", self.prompt("Имя"),
                                                         self.prompt("Абсолютный путь к стартовому скрипту в Debian"))),
-            ("Убрать из запуска", lambda: manage_service("remove", self.prompt("Имя службы"))),
+            ("Убрать из запуска", lambda: self.job("Служба", "service", "remove", self.prompt("Имя службы"))),
         ))
 
     def servers(self):
-        def restart():
-            stop()
-            start()
         self.pick("Управление PhoneHost", (
-            ("Запустить сервер", start),
-            ("Остановить сервер", stop),
-            ("Перезапустить сервер", restart),
-            ("Статус и адреса", status),
+            ("Запустить сервер", lambda: self.job("Запуск PhoneHost", "start")),
+            ("Остановить сервер", lambda: self.job("Остановка PhoneHost", "stop")),
+            ("Перезапустить сервер", lambda: self.job("Перезапуск PhoneHost", "restart")),
+            ("Статус и адреса", lambda: self.job("Статус", "status")),
             ("Мои фоновые службы", self.services),
-            ("Статистика HTTP за час", lambda: traffic(60, 10)),
+            ("Статистика HTTP за час", lambda: self.job("Статистика", "stats", "--minutes", "60", "--top", "10")),
         ))
 
     def boxes(self):
         actions = (("Создать отдельный Debian", "create"), ("Запустить коробку", "start"),
-                   ("Остановить коробку", "stop"), ("Терминал коробки", "shell"))
+                   ("Остановить коробку", "stop"))
         self.pick("Коробки Debian", (
-            ("Список и локальные адреса", lambda: manage_box("list")),
-            *((label, lambda action=action: manage_box(action, self.prompt("Имя коробки")))
+            ("Список и локальные адреса", lambda: self.job("Коробки", "box", "list")),
+            *((label, lambda action=action, label=label: self.job(label, "box", action, self.prompt("Имя коробки")))
               for label, action in actions),
+            ("Терминал коробки", self.open_box_shell),
+        ))
+
+    def options(self):
+        self.pick("Инструменты Shark", (
+            ("IP и локальная сеть", self.network),
+            ("Домены, реестры и сертификаты", self.lookup),
+            ("Анализ файлов", self.files),
+            ("Диагностика устройства", lambda: self.job("Устройство", "doctor")),
         ))
 
     def run(self):
-        if sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ:
-            print("\033[38;5;80m" + SCYTHE + "\033[0m", end="")
-        else:
-            print(SCYTHE, end="")
-        print(f"  SHARK CONSOLE · {VERSION} · # @ % &")
+        self.mode(True)
         try:
             self.pick("Пульт управления", (
-                ("IP и локальная сеть", self.network),
-                ("Домены, реестры и сертификаты", self.lookup),
-                ("Анализ файлов", self.files),
+                ("Текущий Wi-Fi", lambda: self.inventory("wifi")),
+                ("Своя точка доступа", lambda: self.inventory("hotspot")),
+                ("Быстрый сервер · IP и пароль", lambda: self.job("Быстрый сервер", "quick-server")),
                 ("Управление сервером", self.servers),
                 ("Коробки Debian", self.boxes),
-                ("Диагностика устройства", doctor),
+                ("Инструменты Shark", self.options),
             ), root=True)
         except EOFError:
-            print()
+            if not self.full:
+                print()
+        finally:
+            self.mode(False)
+
+
+def console_view(argv):
+    views = {
+        "local": (0, local_network), "public": (0, public_address), "clients": (0, show_clients),
+        "leases": (1, lambda path: show_leases(Path(path))),
+        "subnet": (1, subnet_info), "reverse": (1, reverse_dns), "tls": (1, check_tls),
+        "format": (1, lambda path: inspect_file(Path(path))),
+        "metadata": (1, lambda path: inspect_file(Path(path), metadata=True)),
+    }
+    if not argv or argv[0] not in views or len(argv) - 1 != views[argv[0]][0]:
+        raise UserError("Неизвестное действие панели.")
+    views[argv[0]][1](*argv[1:])
 
 
 DNS_TYPES = ("A", "AAAA", "MX", "NS", "TXT", "CAA", "SOA")
@@ -1535,6 +1830,9 @@ DNS_TYPES = ("A", "AAAA", "MX", "NS", "TXT", "CAA", "SOA")
 def main(argv):
     os.umask(0o077)
     raw = argv[0] if argv else ""
+    if raw == "_console-view":
+        console_view(argv[1:])
+        return
     if raw in ("_supervise", "_supervise_boxes"):
         supervise(boxes_only=raw == "_supervise_boxes")
         return
@@ -1556,7 +1854,13 @@ def main(argv):
     sub.add_parser("stop", help="остановить службы PhoneHost")
     sub.add_parser("restart", help="перезапустить службы PhoneHost")
     sub.add_parser("status", help="проверить службы и показать IP и порты")
-    sub.add_parser("console", help="открыть интерактивную панель Shark")
+    p = sub.add_parser("console", help="открыть интерактивную панель Shark")
+    p.add_argument("--root-network", action="store_true", help="разрешить чтение системных данных сети через su")
+    p = sub.add_parser("network", help="посмотреть текущий Wi-Fi или свою точку доступа")
+    p.add_argument("kind", choices=("wifi", "hotspot"))
+    p.add_argument("--root", action="store_true", help="только чтение системных данных через su")
+    p = sub.add_parser("quick-server", help="создать локальный веб-сервер с паролем")
+    p.add_argument("--name", help="имя новой коробки")
     boxes = sub.add_parser("box", help="отдельные среды Debian и локальные веб-серверы")
     box_commands = boxes.add_subparsers(dest="action", required=True)
     box_commands.add_parser("list", help="список коробок")
@@ -1626,7 +1930,11 @@ def main(argv):
     elif opts.cmd == "status":
         status()
     elif opts.cmd == "console":
-        SharkConsole().run()
+        SharkConsole(opts.root_network).run()
+    elif opts.cmd == "network":
+        network_inventory(opts.kind, opts.root)
+    elif opts.cmd == "quick-server":
+        quick_server(opts.name)
     elif opts.cmd == "box":
         manage_box(opts.action, getattr(opts, "name", None))
     elif opts.cmd == "doctor":
