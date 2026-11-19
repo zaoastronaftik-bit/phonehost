@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PhoneHost 0.2.1 • Debian on Termux, without flashing Android.
+# PhoneHost 0.3 • Debian on Termux, without flashing Android.
 set -euo pipefail
 umask 077
 
@@ -29,7 +29,9 @@ from collections import Counter
 import contextlib
 import fcntl
 import getpass
+import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -46,9 +48,11 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 INSTALL_SECONDS = 300
 PREFIX = Path(os.environ.get("PREFIX") or Path(__file__).resolve().parent.parent)
 STATE = Path.home() / ".phonehost"
@@ -941,6 +945,129 @@ def int_range(low, high):
     return parse
 
 
+RDAP_REGISTRIES = frozenset((
+    "data.iana.org", "rdap.arin.net", "rdap.apnic.net",
+    "rdap.db.ripe.net", "rdap.lacnic.net", "rdap.afrinic.net",
+))
+
+
+def registry_url(url):
+    parts = urlsplit(url)
+    return (parts.scheme == "https" and parts.hostname in RDAP_REGISTRIES
+            and parts.username is None and parts.password is None and parts.port in (None, 443))
+
+
+class RegistryRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not registry_url(newurl):
+            raise UserError("RDAP ответил перенаправлением за пределы поддерживаемых реестров.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def registry_json(url):
+    if not registry_url(url):
+        raise UserError("Поддерживаются только HTTPS-адреса реестров IANA и RIR.")
+    with build_opener(RegistryRedirect()).open(
+        Request(url, headers={"Accept": "application/rdap+json, application/json", "User-Agent": f"PhoneHost/{VERSION}"}),
+        timeout=8,
+    ) as response:
+        data = response.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise UserError("Ответ реестра слишком большой.")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise UserError("Реестр не вернул JSON-объект.")
+    return value
+
+
+def rdap_endpoint(address, bootstrap):
+    match = None
+    for group in bootstrap.get("services", ()):
+        if not isinstance(group, list) or len(group) != 2:
+            continue
+        ranges, urls = group
+        base = next((url for url in urls if registry_url(url)), None)
+        if not base:
+            continue
+        for raw in ranges:
+            network = ipaddress.ip_network(raw)
+            if address in network and (match is None or network.prefixlen > match[0]):
+                match = (network.prefixlen, base)
+    if match is None:
+        raise UserError("Реестр для этого IP не найден.")
+    return match[1].rstrip("/") + "/ip/" + str(address)
+
+
+def rdap_lookup(raw_ip):
+    address = ipaddress.ip_address(raw_ip)
+    if address.version == 6 and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if (not address.is_global or address.is_multicast or address.is_reserved
+            or getattr(address, "scope_id", None)):
+        raise UserError("У локального или специального адреса нет провайдера в RDAP. Запрос не отправлен.")
+    bootstrap = registry_json(f"https://data.iana.org/rdap/ipv{address.version}.json")
+    url = rdap_endpoint(address, bootstrap)
+    record = registry_json(url)
+    print(f"IP             {address}")
+    print(f"Регистрация    {clean(str(record.get('name') or record.get('handle') or 'не указана'))}")
+    if record.get("startAddress") and record.get("endAddress"):
+        print(f"Диапазон       {clean(str(record['startAddress']))} — {clean(str(record['endAddress']))}")
+    holders = set()
+    for entity in record.get("entities", []):
+        if not isinstance(entity, dict) or "registrant" not in entity.get("roles", ()):
+            continue
+        cards = entity.get("vcardArray")
+        if not isinstance(cards, list) or len(cards) != 2 or not isinstance(cards[1], list):
+            continue
+        fields = {row[0]: row[3] for row in cards[1] if isinstance(row, list) and len(row) >= 4}
+        name = fields.get("org") or (fields.get("fn") if fields.get("kind") == "org" else None)
+        if isinstance(name, list):
+            name = next((n for n in name if isinstance(n, str) and n.strip()), None)
+        if isinstance(name, str) and clean(name):
+            holders.add(clean(name)[:160])
+    if holders:
+        print("Организация    " + ", ".join(sorted(holders)))
+    print(f"Реестр         {urlsplit(url).hostname}")
+    print("Это регистрация диапазона, а не имя владельца устройства или обязательно его оператор.")
+
+
+def dns_domain(raw):
+    text = raw.rstrip(".").encode("idna").decode("ascii")
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    if len(text) > 253 or not re.fullmatch(rf"{label}(?:\.{label})*", text):
+        raise UserError("Укажи имя домена без URL, порта и параметров.")
+    return text + "."
+
+
+def toolbox(opts):
+    if opts.action == "list":
+        print("dns    DNS-записи · dig из Debian")
+        print("rdap   Регистрация публичного IP · IANA/RDAP")
+        print("hash   SHA-256 локального файла · Python")
+        print("install  Пакеты bind9-dnsutils, jq и openssl в Debian")
+    elif opts.action == "install":
+        read_config()
+        subprocess.run(guest("/usr/bin/apt-get", "update"), check=True)
+        subprocess.run(guest("/usr/bin/apt-get", "install", "-y", "--no-install-recommends",
+                             "bind9-dnsutils", "jq", "openssl"), check=True)
+    elif opts.action == "dns":
+        read_config()
+        domain = dns_domain(opts.domain)
+        probe = subprocess.run(guest("/usr/bin/test", "-x", "/usr/bin/dig"), check=False)
+        if probe.returncode != 0:
+            raise UserError("Установи DNS-инструменты командой phonehost toolbox install.")
+        subprocess.run(guest("/usr/bin/dig", domain, opts.type, "+time=3", "+tries=1",
+                             "+noall", "+comments", "+answer"), check=True)
+    elif opts.action == "rdap":
+        rdap_lookup(opts.ip)
+    elif opts.action == "hash":
+        digest = hashlib.sha256()
+        with opts.path.open("rb") as file:
+            for block in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(block)
+        print(f"{digest.hexdigest()}  {clean(str(opts.path))}")
+
+
 def main(argv):
     os.umask(0o077)
     raw = argv[0] if argv else ""
@@ -1006,6 +1133,15 @@ def main(argv):
     remove = service.add_parser("remove", help="убрать службу из автозапуска без удаления файлов")
     remove.add_argument("name")
     service.add_parser("list", help="перечислить свои службы")
+    p = sub.add_parser("toolbox", help="диагностика сети и проверка файлов")
+    tools = p.add_subparsers(dest="action", required=True)
+    tools.add_parser("list", help="показать доступные инструменты")
+    tools.add_parser("install", help="установить диагностические пакеты Debian")
+    dns = tools.add_parser("dns", help="посмотреть DNS-записи домена")
+    dns.add_argument("domain")
+    dns.add_argument("--type", default="A", choices=("A", "AAAA", "MX", "NS", "TXT", "CAA", "SOA"))
+    tools.add_parser("rdap", help="найти регистрацию публичного IP").add_argument("ip")
+    tools.add_parser("hash", help="посчитать SHA-256 файла в Termux").add_argument("path", type=Path)
     opts = menu.parse_args(argv)
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     if opts.cmd == "install":
@@ -1043,6 +1179,8 @@ def main(argv):
         bench(opts.requests, opts.workers)
     elif opts.cmd == "service":
         manage_service(opts.action, getattr(opts, "name", None), getattr(opts, "script", None))
+    elif opts.cmd == "toolbox":
+        toolbox(opts)
     else:
         menu.print_help()
 
