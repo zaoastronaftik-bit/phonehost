@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PhoneHost 0.5 • Debian on Termux, without flashing Android.
+# PhoneHost 0.6 • Debian on Termux, without flashing Android.
 set -euo pipefail
 umask 077
 
@@ -31,6 +31,7 @@ import fcntl
 import getpass
 import hashlib
 import http.client
+from html.parser import HTMLParser
 import ipaddress
 import json
 import math
@@ -52,11 +53,13 @@ import sys
 import threading
 import time
 import textwrap
-from urllib.parse import urlsplit
+import unicodedata
+from urllib.error import HTTPError
+from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 INSTALL_SECONDS = 300
 PREFIX = Path(os.environ.get("PREFIX") or Path(__file__).resolve().parent.parent)
 STATE = Path.home() / ".phonehost"
@@ -1567,6 +1570,792 @@ def inspect_file(path, metadata=False):
         print("Из выбранных метаданных ничего не найдено.")
 
 
+CASE_LV_RESOURCE = "25e80bf3-f107-4ab4-89ef-251b5b9374e9"
+CASE_FNS = "https://egrul.nalog.ru/"
+CASE_GOV_LV = "https://data.gov.lv/dati/dataset/uz/resource/" + CASE_LV_RESOURCE
+CASE_MAX_BODY = 1536 * 1024
+CASE_SOCIAL = {
+    "t.me": 1, "telegram.me": 1, "vk.com": 1, "instagram.com": 1, "facebook.com": 1,
+    "youtube.com": 1, "tiktok.com": 1, "x.com": 1, "twitter.com": 1, "linkedin.com": 2,
+}
+CASE_SOCIAL_RESERVED = {
+    "share", "share.php", "intent", "login", "explore", "accounts", "reel", "reels",
+    "stories", "search", "watch", "shorts", "videos", "i", "home", "joinchat", "s", "p", "repost",
+}
+CASE_LEI_CATEGORIES = {"GENERAL", "FUND", "BRANCH", "RESIDENT_GOVERNMENT_ENTITY", "INTERNATIONAL_ORGANIZATION"}
+CASE_ORGANIZATIONS = {
+    "organization", "corporation", "localbusiness", "store", "onlinestore", "onlinebusiness",
+    "professionalservice", "restaurant", "foodestablishment", "financialservice", "bankorcreditunion",
+    "hotel", "medicalorganization", "educationalorganization", "automotivebusiness", "softwarecompany",
+}
+CASE_LABELS = {
+    "organization": "Название на сайте", "description": "Деятельность по описанию сайта",
+    "activity": "Категория на сайте", "phone": "Публичный телефон", "profile": "Ссылка на профиль",
+    "identifier": "Реквизит на сайте",
+}
+
+
+CASE_LABELED_IDS = re.compile(
+    r"(?<!\w)(?:ИНН|ОГРН|LEI|reģistrācijas\s+(?:numurs|nr\.?)|reg\.\s*nr\.?)"
+    r"\s*[:№#]?\s*((?:[A-Z0-9]{18}[0-9]{2}|(?:LV)?[0-9]{10,13}))(?![A-Z0-9])", re.I
+)
+CASE_LABELED_PHONE = re.compile(
+    r"(?<!\w)(?:тел(?:ефон)?\.?|phone|tālrunis|tel\.?)\s*[:☎]?\s*(\+?[0-9(][0-9(). -]{6,25}[0-9])",
+    re.I
+)
+
+
+def case_text(value, limit=240):
+    if not isinstance(value, str):
+        return ""
+    value = "".join(c if c.isspace() else " " if unicodedata.category(c)[0] == "C" else c for c in value)
+    return " ".join(value.split())[:limit]
+
+
+def case_url(raw):
+    if not isinstance(raw, str) or not raw or len(raw) > 900 or "\\" in raw:
+        raise ValueError("Некорректный HTTPS-адрес.")
+    if any(c.isspace() or unicodedata.category(c)[0] == "C" for c in raw):
+        raise ValueError("Некорректный HTTPS-адрес.")
+    if "://" not in raw:
+        raw = "https://" + raw
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if (parts.scheme != "https" or parts.username is not None or parts.password is not None
+            or parts.port not in (None, 443) or len(host) > 253
+            or not re.fullmatch(rf"(?:{label}\.)+[a-z](?:[a-z0-9-]{{0,61}}[a-z0-9])?", host)
+            or host.endswith((".localhost", ".local", ".internal", ".test", ".invalid", ".example", ".onion"))):
+        raise ValueError("Нужен публичный HTTPS-адрес без логина и нестандартного порта.")
+    path = quote(parts.path or "/", safe="/:@!$&'()*+,;=-._~%")
+    return urlunsplit(("https", host, path, "", ""))
+
+
+def case_host(url):
+    host = urlsplit(url).hostname or ""
+    return host.removeprefix("www.")
+
+
+def case_profile(raw):
+    if not raw.startswith("https://"):
+        return ""
+    try:
+        url = case_url(raw)
+    except (ValueError, UnicodeError):
+        return ""
+    host = case_host(url)
+    count = CASE_SOCIAL.get(host)
+    if count is None:
+        return ""
+    path = urlsplit(url).path.strip("/").split("/")
+    if host == "linkedin.com" and (not path or path[0] not in ("company", "school")):
+        return ""
+    if len(path) != count or path[0].lower() in CASE_SOCIAL_RESERVED:
+        return ""
+    if not re.fullmatch(r"@?[A-Za-z0-9_.-]{2,80}", path[-1]):
+        return ""
+    return f"https://{'t.me' if host == 'telegram.me' else host}/" + "/".join(path)
+
+
+def case_phone(raw, country):
+    if not isinstance(raw, str) or not re.fullmatch(r"\+?[0-9(). \u00a0-]{7,28}", raw.strip()):
+        return ""
+    raw = raw.strip()
+    digits = re.sub(r"[^0-9]", "", raw)
+    if raw.startswith("+"):
+        return "+" + digits if re.fullmatch(r"[1-9][0-9]{7,14}", digits) else ""
+    if digits.startswith("00") and re.fullmatch(r"00[1-9][0-9]{7,14}", digits):
+        return "+" + digits[2:]
+    if country == "RU" and re.fullmatch(r"[78][0-9]{10}", digits):
+        return "+7" + digits[1:]
+    if country == "RU" and re.fullmatch(r"[3489][0-9]{9}", digits):
+        return "+7" + digits
+    if country == "LV" and re.fullmatch(r"[26][0-9]{7}", digits):
+        return "+371" + digits
+    return ""
+
+
+def case_identifier(raw):
+    value = re.sub(r"[\s-]+", "", str(raw or "")).upper()
+    if re.fullmatch(r"[A-Z0-9]{18}[0-9]{2}", value):
+        expanded = "".join(str(ord(c) - 55) if c.isalpha() else c for c in value)
+        return ("LEI", value) if int(expanded) % 97 == 1 else ("", "")
+    if re.fullmatch(r"LV[0-9]{11}", value):
+        value = value[2:]
+    if re.fullmatch(r"[1-9][0-9]{10}", value):
+        return "LV", value
+    if re.fullmatch(r"[0-9]{10}", value) and value != "0000000000":
+        checksum = sum(int(d) * w for d, w in zip(value, (2, 4, 10, 3, 5, 9, 4, 6, 8))) % 11 % 10
+        if checksum == int(value[-1]):
+            return "RU", value
+    if re.fullmatch(r"[15][0-9]{12}", value) and int(value[:-1]) % 11 % 10 == int(value[-1]):
+        return "RU", value
+    return "", ""
+
+
+class CaseNoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def case_json(url, *, headers=None, data=None):
+    req = Request(url, headers={"Accept": "application/json", "User-Agent": f"PhoneHost/{VERSION}",
+                                **(headers or {})}, data=data)
+    try:
+        with build_opener(CaseNoRedirect()).open(req, timeout=12) as response:
+            raw = case_read(response, time.monotonic() + 12)
+        value = json.loads(raw)
+    except HTTPError as exc:
+        raise UserError(f"HTTP {exc.code}") from None
+    except (OSError, ValueError, http.client.HTTPException):
+        raise UserError("источник недоступен или вернул неожиданный ответ") from None
+    if not isinstance(value, dict):
+        raise UserError("неожиданный формат ответа")
+    return value
+
+
+def case_read(response, deadline):
+    chunks = bytearray()
+    while time.monotonic() < deadline:
+        chunk = response.read1(min(65536, CASE_MAX_BODY + 1 - len(chunks)))
+        if not chunk:
+            return bytes(chunks)
+        chunks.extend(chunk)
+        if len(chunks) > CASE_MAX_BODY:
+            raise ValueError("Ответ слишком большой.")
+    raise TimeoutError("Источник долго отвечает.")
+
+
+def case_public_ips(host):
+    addresses = []
+    for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
+        ip = ipaddress.ip_address(info[4][0])
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if (not ip.is_global or ip.is_multicast or ip.is_reserved or getattr(ip, "scope_id", None)
+                or (ip.version == 6 and any(ip in n for n in CASE_TRANSITION_NETWORKS))):
+            continue
+        if str(ip) not in addresses:
+            addresses.append(str(ip))
+    if not addresses:
+        raise ValueError("Нет общедоступного адреса.")
+    return sorted(addresses, key=lambda ip: ":" in ip)
+
+
+CASE_TRANSITION_NETWORKS = tuple(map(ipaddress.ip_network, (
+    "64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "2002::/16",
+)))
+
+
+class CaseConnection(http.client.HTTPSConnection):
+    def __init__(self, hostname, ip, timeout):
+        super().__init__(hostname, timeout=timeout, context=ssl.create_default_context())
+        self.ip = ip
+
+    def connect(self):
+        raw = socket.create_connection((self.ip, 443), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+def case_html(url):
+    url = case_url(url)
+    host = case_host(url)
+    deadline = time.monotonic() + 10
+    for _ in range(3):
+        parts = urlsplit(url)
+        response = None
+        for ip in case_public_ips(parts.hostname)[:3]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            conn = CaseConnection(parts.hostname, ip, min(4, remaining))
+            try:
+                conn.request("GET", parts.path, headers={"Accept": "text/html, application/xhtml+xml",
+                             "User-Agent": f"PhoneHost/{VERSION}"})
+                response = conn.getresponse()
+            except (OSError, http.client.HTTPException):
+                conn.close()
+                continue
+            break
+        if response is None:
+            raise UserError("страница не ответила по HTTPS")
+        try:
+            if response.status in (301, 302, 303, 307, 308):
+                jump = response.getheader("Location")
+                if not jump:
+                    raise UserError("перенаправление без адреса")
+                target = case_url(urljoin(url, jump))
+                if case_host(target) != host:
+                    raise UserError("страница перенаправляет на другой сайт")
+                url = target
+                continue
+            if response.status != 200:
+                raise UserError(f"HTTP {response.status}")
+            msg = response.headers
+            if msg.get_content_type() not in ("text/html", "application/xhtml+xml"):
+                raise UserError("адрес не вернул HTML-страницу")
+            raw = case_read(response, deadline)
+            try:
+                return url, raw.decode(msg.get_content_charset() or "utf-8", "replace")
+            except LookupError:
+                return url, raw.decode("utf-8", "replace")
+        finally:
+            response.close()
+            conn.close()
+    raise UserError("слишком много перенаправлений")
+
+
+def case_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def case_list(value):
+    return value if isinstance(value, list) else [] if value is None else [value]
+
+
+class CasePage(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.jsonld = []
+        self.script = None
+        self.hidden = 0
+        self.visible = []
+        self.meta = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in ("script", "style", "noscript", "template"):
+            self.hidden += 1
+        if tag == "meta":
+            field = (attrs.get("property") or attrs.get("name") or "").lower()
+            if field in ("og:site_name", "og:description", "description"):
+                self.meta[field] = attrs.get("content")
+        if not self.hidden and tag == "a" and attrs.get("href") and len(self.links) < 500:
+            self.links.append(attrs["href"])
+        if tag == "script" and (attrs.get("type") or "").lower().strip() == "application/ld+json":
+            self.script = []
+
+    def handle_data(self, data):
+        if self.script is not None:
+            self.script.append(data)
+        elif not self.hidden and len(self.visible) < 12000:
+            self.visible.append(data.strip())
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "template") and self.hidden:
+            self.hidden -= 1
+        if tag != "script" or self.script is None:
+            return
+        if len(self.jsonld) < 25:
+            try:
+                self.jsonld.append(json.loads("".join(self.script)))
+            except (ValueError, RecursionError):
+                pass
+        self.script = None
+
+
+def case_organizations(values):
+    candidates = deque(values)
+    inspected = 0
+    while candidates and inspected < 250:
+        value = candidates.popleft()
+        inspected += 1
+        if isinstance(value, list):
+            candidates.extend(value[:40])
+        elif isinstance(value, dict):
+            kinds = {case_text(t).rsplit("/", 1)[-1].lower() for t in case_list(value.get("@type"))}
+            if kinds & CASE_ORGANIZATIONS:
+                yield value
+            for key in ("@graph", "publisher", "provider", "mainEntity"):
+                if key in value:
+                    candidates.append(value[key])
+
+
+def case_evidence(url, html, country, *, supplied):
+    page = CasePage()
+    page.feed(html)
+    page.close()
+    facts = set()
+    internal = set()
+
+    def add(kind, value):
+        value = case_text(value, 360)
+        if value:
+            facts.add((kind, value))
+
+    for obj in case_organizations(page.jsonld):
+        for key in ("legalName", "name"):
+            add("organization", obj.get(key))
+        add("description", obj.get("description"))
+        for key in ("industry", "category", "serviceType", "naics", "isicV4", "knowsAbout"):
+            for activity in case_list(obj.get(key))[:8]:
+                add("activity", activity)
+        for key in ("leiCode", "taxID", "vatID", "identifier"):
+            for ident in case_list(obj.get(key))[:5]:
+                kind, value = case_identifier(case_dict(ident).get("value") if isinstance(ident, dict) else ident)
+                if kind:
+                    add("identifier", value)
+        for contact in (obj, *case_list(obj.get("contactPoint"))[:8]):
+            for number in case_list(case_dict(contact).get("telephone"))[:6]:
+                add("phone", case_phone(number, country))
+        for remote in case_list(obj.get("sameAs"))[:20]:
+            if isinstance(remote, str):
+                add("profile", case_profile(remote))
+
+    if supplied:
+        add("organization", page.meta.get("og:site_name"))
+        if not any(k == "description" for k, _ in facts):
+            add("description", page.meta.get("og:description") or page.meta.get("description"))
+        visible = " ".join(page.visible)
+        for match in CASE_LABELED_IDS.finditer(visible):
+            kind, value = case_identifier(match[1])
+            if kind:
+                add("identifier", value)
+        for match in CASE_LABELED_PHONE.finditer(visible):
+            add("phone", case_phone(match[1], country))
+        for href in page.links:
+            if len(href) > 900:
+                continue
+            if href.lower().startswith("tel:"):
+                add("phone", case_phone(unquote(href[4:]), country))
+                continue
+            try:
+                target = case_url(urljoin(url, href))
+            except (ValueError, UnicodeError):
+                continue
+            profile = case_profile(target)
+            if profile:
+                add("profile", profile)
+            elif case_host(target) == case_host(url) and re.search(
+                    r"(?:^|[/_-])(contact[s]?|about|impressum|kontakti|kontakty|rekvizity|"
+                    r"контакты|реквизиты|о-компании)(?=$|[/_.-])", unquote(urlsplit(target).path), re.I):
+                internal.add(target)
+    return sorted(facts), sorted(internal, key=lambda u: (len(u), u))
+
+
+def case_registry(kind, identifier):
+    if kind == "LV":
+        fields = "regcode,name,type,type_text,regtype,registered,terminated,closed"
+        url = "https://data.gov.lv/dati/api/3/action/datastore_search?" + urlencode({
+            "resource_id": CASE_LV_RESOURCE, "filters": json.dumps({"regcode": int(identifier)}),
+            "fields": fields, "limit": 1, "include_total": "false",
+        })
+        data = case_json(url)
+        rows = case_dict(data.get("result")).get("records")
+        if data.get("success") is not True or not isinstance(rows, list):
+            raise UserError("реестр не вернул список записей")
+        for r in map(case_dict, rows):
+            if str(r.get("regcode")) != identifier:
+                continue
+            # Keep company types only. No individual merchants, farms or sole traders.
+            if r.get("type") not in ("SIA", "AS", "PS", "KS", "SE"):
+                return {"status": "outside_scope", "source": CASE_GOV_LV, "id": identifier}
+            name = case_text(r.get("name"))
+            if not name:
+                raise UserError("неполная запись реестра")
+            return {"status": "found", "source": CASE_GOV_LV, "id": identifier, "name": name,
+                    "form": case_text(r.get("type_text")), "registered": case_text(r.get("registered"))[:10],
+                    "state": ("исключена из реестра" if r.get("terminated") else
+                              "причина закрытия указана" if case_text(r.get("closed")) else
+                              "в записи нет даты исключения")}
+        return {"status": "not_found", "source": CASE_GOV_LV, "id": identifier}
+    if kind == "LEI":
+        url = "https://api.gleif.org/api/v1/lei-records/" + identifier
+        source = "https://search.gleif.org/#/record/" + identifier
+        try:
+            row = case_dict(case_json(url).get("data"))
+        except UserError as exc:
+            if str(exc) == "HTTP 404":
+                return {"status": "not_found", "source": source, "id": identifier}
+            raise
+        attrs = case_dict(row.get("attributes"))
+        entity = case_dict(attrs.get("entity"))
+        if row.get("id") != identifier or not entity:
+            raise UserError("неожиданный ответ GLEIF")
+        if entity.get("category") not in CASE_LEI_CATEGORIES:
+            return {"status": "outside_scope", "source": source, "id": identifier}
+        name = case_text(case_dict(entity.get("legalName")).get("name"))
+        if not name:
+            raise UserError("неполная запись GLEIF")
+        return {"status": "found", "source": source, "id": identifier, "name": name,
+                "state": case_text(entity.get("status")), "jurisdiction": case_text(entity.get("jurisdiction")),
+                "registered": case_text(entity.get("creationDate"))[:10]}
+    if kind == "RU":
+        token = os.environ.get("PHONEHOST_DADATA_KEY", "").strip()
+        if not token:
+            return {"status": "manual", "source": CASE_FNS, "id": identifier}
+        data = case_json("https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party",
+                         headers={"Authorization": "Token " + token, "Content-Type": "application/json"},
+                         data=json.dumps({"query": identifier, "type": "LEGAL", "count": 8}).encode())
+        rows = data.get("suggestions")
+        if not isinstance(rows, list):
+            raise UserError("DaData не вернула список записей")
+        for suggestion in map(case_dict, rows):
+            row = case_dict(suggestion.get("data"))
+            if row.get("type") != "LEGAL" or identifier not in (row.get("inn"), row.get("ogrn")):
+                continue
+            name = case_text(case_dict(row.get("name")).get("full_with_opf"))
+            if not name:
+                raise UserError("неполная запись DaData")
+            return {"status": "found", "source": "https://dadata.ru/api/find-party/",
+                    "official": CASE_FNS, "id": identifier, "name": name, "jurisdiction": "RU",
+                    "state": case_text(case_dict(row.get("state")).get("status")),
+                    "activity": case_text(row.get("okved")), "activity_type": "ОКВЭД"}
+        return {"status": "not_found", "source": "https://dadata.ru/api/find-party/",
+                "official": CASE_FNS, "id": identifier}
+    raise ValueError("Неизвестный реестр.")
+
+
+def case_registry_name(name):
+    url = "https://api.gleif.org/api/v1/lei-records?" + urlencode({
+        "filter[entity.legalName]": name, "page[size]": 8,
+    })
+    rows = case_json(url).get("data")
+    if not isinstance(rows, list):
+        raise UserError("GLEIF не вернул список записей")
+    matches = []
+    for row in map(case_dict, rows):
+        entity = case_dict(case_dict(row.get("attributes")).get("entity"))
+        candidate = case_text(case_dict(entity.get("legalName")).get("name"))
+        _, identifier = case_identifier(row.get("id"))
+        if not identifier or case_key(candidate) != case_key(name):
+            continue
+        if entity.get("category") not in CASE_LEI_CATEGORIES:
+            continue
+        matches.append({"status": "name_match", "source": "https://search.gleif.org/#/record/" + identifier,
+                        "id": identifier, "name": candidate, "state": case_text(entity.get("status")),
+                        "jurisdiction": case_text(entity.get("jurisdiction"))})
+    return matches
+
+
+def case_discovery(name, phone, handle):
+    token = os.environ.get("PHONEHOST_BRAVE_KEY", "").strip()
+    if not token:
+        return [], "Веб-поиск не запущен · настрой PHONEHOST_BRAVE_KEY или укажи сайт."
+    terms = ['"' + value.replace('"', '') + '"' for value in (name, phone, handle) if value]
+    if not terms:
+        return [], "Для веб-поиска укажи название компании, рабочий телефон или деловой @ник."
+    query = ("(" + " OR ".join(terms) + ")" if len(terms) > 1 else terms[0]) + " (contact OR контакты OR kontakti)"
+    data = case_json("https://api.search.brave.com/res/v1/web/search?" + urlencode({
+        "q": query, "count": 10, "country": "ALL",
+    }), headers={"X-Subscription-Token": token})
+    rows = case_dict(data.get("web")).get("results", [])
+    if not isinstance(rows, list):
+        raise UserError("веб-поиск не вернул список страниц")
+    results = {}
+    for row in map(case_dict, rows[:10]):
+        try:
+            url = case_url(row.get("url", ""))
+        except (ValueError, UnicodeError):
+            continue
+        host = case_host(url)
+        if host not in CASE_SOCIAL:
+            results.setdefault(host, url)
+    return list(results.values())[:4], None
+
+
+def case_key(value):
+    value = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+    return " ".join(re.findall(r"[^\W_]+", value))
+
+
+def case_match(facts, name, phone, handle):
+    if phone and ("phone", phone) in facts:
+        return True
+    if handle and any(kind == "profile" and url.rsplit("/", 1)[-1].lstrip("@").casefold() == handle
+                      for kind, url in facts):
+        return True
+    return bool(name and any(kind == "organization" and case_key(value) == case_key(name)
+                             for kind, value in facts))
+
+
+def case_bill(path, country):
+    path = path.expanduser().resolve()
+    if not path.is_file() or path.stat().st_size > 15 * 1024 * 1024:
+        raise UserError("Для сверки нужен локальный файл размером до 15 МБ.")
+    if path.suffix.lower() == ".txt":
+        with path.open("rb") as file:
+            raw = file.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            raise UserError("Текст счёта больше 64 КБ.")
+        text = raw.decode("utf-8-sig", "replace")
+    elif path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+        tesseract = shutil.which("tesseract")
+        if not tesseract:
+            raise UserError("Для фото нужен локальный Tesseract. Можно подать текст счёта в .txt.")
+        lang = os.getenv("PHONEHOST_OCR_LANG", "eng")
+        if not re.fullmatch(r"[a-z_]{2,16}(?:\+[a-z_]{2,16}){0,3}", lang):
+            raise UserError("Некорректный язык OCR в PHONEHOST_OCR_LANG.")
+        result = subprocess.run([tesseract, str(path), "stdout", "-l", lang], capture_output=True,
+                                timeout=22, check=False)
+        if result.returncode:
+            raise UserError("Tesseract не прочитал изображение. Проверь, установлен ли выбранный язык.")
+        text = result.stdout[:64 * 1024].decode("utf-8", "replace")
+    else:
+        raise UserError("Поддерживаются TXT, PNG, JPEG и WebP.")
+    facts = set()
+    for line in text.splitlines():
+        for match in CASE_LABELED_IDS.finditer(line):
+            _, value = case_identifier(match[1])
+            if value:
+                facts.add(("identifier", value))
+        for match in CASE_LABELED_PHONE.finditer(line):
+            if value := case_phone(match[1], country):
+                facts.add(("phone", value))
+    return sorted(facts)[:12]
+
+
+def case_phone_region(country, phone, url):
+    if country in ("RU", "LV"):
+        return country
+    if phone.startswith("+371") or case_host(url).endswith(".lv"):
+        return "LV"
+    if phone.startswith("+7") or case_host(url).endswith((".ru", ".su", ".xn--p1ai")):
+        return "RU"
+    return ""
+
+
+def case_collect(opts):
+    raw_handle = opts.handle or ""
+    handle = raw_handle.lstrip("@").casefold()
+    if raw_handle and not re.fullmatch(r"@?[a-zA-Z0-9_.-]{2,50}", raw_handle):
+        raise UserError("Укажи короткий публичный @ник без пробелов.")
+    name = case_text(opts.company)
+    country, number = case_identifier(opts.registration)
+    if opts.registration and not number:
+        raise UserError("Реквизит не распознан. Укажи ИНН юрлица, ОГРН, регномер Латвии или LEI.")
+    phone = case_phone(opts.phone, country)
+    if opts.phone and not phone:
+        raise UserError("Введи рабочий телефон в международном формате, начиная с +.")
+    sites = list(dict.fromkeys(case_url(s) for s in (opts.site or [])))
+    if len(sites) > 2:
+        raise UserError("Укажи не больше двух публичных сайтов за одну проверку.")
+    if any(case_host(site) in CASE_SOCIAL for site in sites):
+        raise UserError("В поле сайта укажи сайт компании. Соцсеть можно указать как @ник.")
+    if not any((name, phone, handle, number, sites, opts.bill)):
+        raise UserError("Укажи хотя бы один исходный реквизит или сайт компании.")
+    report = {"schema": 1, "checked_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "input": {"company": name, "phone": phone, "handle": handle, "registration": number, "sites": sites},
+              "pages": [], "notes": [], "registry": []}
+    if opts.bill:
+        bill_country = case_phone_region(country, phone, sites[0] if sites else "")
+        report["bill"] = [list(row) for row in case_bill(opts.bill, bill_country)]
+        if not report["bill"]:
+            report["notes"].append("В локальном счёте не распознаны телефон или регистрационный номер.")
+
+    def collect(url, supplied):
+        try:
+            actual, html = case_html(url)
+            facts, extra = case_evidence(actual, html, case_phone_region(country, phone, actual),
+                                         supplied=supplied)
+            if supplied or (any(k == "organization" for k, _ in facts) and case_match(facts, name, phone, handle)):
+                return {"url": actual, "source": "supplied" if supplied else "discovered",
+                        "facts": [list(f) for f in facts[:90]]}, extra
+        except (UserError, OSError, ValueError, http.client.HTTPException) as exc:
+            if supplied:
+                return {"url": url, "source": "supplied", "error": case_text(str(exc))}, []
+        return None, []
+
+    def add_page(item):
+        if item and not any(page["url"] == item["url"] for page in report["pages"]):
+            report["pages"].append(item)
+
+    for site in sites:
+        page, extra = collect(site, True)
+        add_page(page)
+        visited = {site, page["url"]} if page else {site}
+        for link in [url for url in extra if url not in visited][:2]:
+            add_page(collect(link, True)[0])
+    if opts.discover:
+        try:
+            candidates, note = case_discovery(name, phone, "@" + handle if handle else "")
+            if note:
+                report["notes"].append(note)
+            tested = {case_host(p["url"]) for p in report["pages"]}
+            for url in candidates:
+                if case_host(url) not in tested:
+                    add_page(collect(url, False)[0])
+            if candidates and not any(p["source"] == "discovered" for p in report["pages"]):
+                report["notes"].append("Веб-поиск не подтвердил дополнительных деловых страниц.")
+            if not candidates and not note:
+                report["notes"].append("Веб-поиск не вернул кандидатов для проверки.")
+        except UserError as exc:
+            report["notes"].append(f"Веб-поиск недоступен · {exc}.")
+    elif not sites and (name or phone or handle):
+        report["notes"].append("Для проверки контактов добавь сайт или включи веб-поиск.")
+    bill_ids = [value for kind, value in report.get("bill", []) if kind == "identifier"]
+    identifiers = list(dict.fromkeys((([number] if number else []) + bill_ids) + sorted({
+        value for p in report["pages"] for kind, value in p.get("facts", []) if kind == "identifier"
+    })))
+    # Auto-detected identifiers are only claims made on the source page.
+    names = [name] if name else list(dict.fromkeys(
+        value for p in report["pages"] for kind, value in p.get("facts", []) if kind == "organization"
+    ))
+    if not identifiers and names:
+        try:
+            report["registry"].extend(case_registry_name(names[0])[:4])
+            if not report["registry"]:
+                report["notes"].append("Точного совпадения по имени в GLEIF нет. LEI есть не у всех компаний.")
+        except UserError as exc:
+            report["notes"].append(f"Поиск названия в GLEIF недоступен · {exc}.")
+    for identifier in identifiers[:3]:
+        kind, _ = case_identifier(identifier)
+        try:
+            record = case_registry(kind, identifier)
+        except UserError as exc:
+            record = {"status": "unavailable", "id": identifier, "error": str(exc)}
+            if kind == "RU":
+                record["official"] = CASE_FNS
+            elif kind == "LV":
+                record["source"] = CASE_GOV_LV
+            elif kind == "LEI":
+                record["source"] = "https://search.gleif.org/#/record/" + identifier
+        report["registry"].append(record)
+    return report
+
+
+def case_changes(previous, report):
+    if not isinstance(previous, dict) or previous.get("schema") != 1 or previous.get("input") != report["input"]:
+        return ["Исходные данные поменялись или формат истории устарел. Сравнение пропущено."]
+    old = {p["url"]: p for p in previous["pages"] if "facts" in p}
+    new = {p["url"]: p for p in report["pages"] if "facts" in p}
+    changes = []
+    for url in sorted(old.keys() & new.keys()):
+        before = {tuple(p) for p in old[url]["facts"]}
+        after = {tuple(p) for p in new[url]["facts"]}
+        for flag, delta in (("+", after - before), ("−", before - after)):
+            for kind, value in sorted(delta):
+                changes.append(f"{flag} {CASE_LABELS[kind]} · {value} · {url}")
+    if not (old.keys() & new.keys()):
+        return ["Нет страниц, прочитанных в обеих проверках. Удаление контакта не предполагалось."]
+    return changes[:30] or ["На повторно прочитанных страницах изменений не обнаружено."]
+
+
+def case_present(report):
+    seed = report["input"]
+    print(f"SHARK / ДЕЛОВОЕ РАССЛЕДОВАНИЕ   {report['checked_utc']}")
+    print(f"Исходные данные · {seed['company'] or '—'} · {seed['phone'] or '—'} · "
+          f"{'@' + seed['handle'] if seed['handle'] else '—'}")
+    print("\nРЕЕСТРЫ")
+    states = {"found": "Запись найдена", "not_found": "Не найдено в этом источнике",
+              "manual": "Ручная проверка в ФНС", "outside_scope": "Не входит в проверяемые формы юрлиц",
+              "unavailable": "Источник недоступен", "name_match": "Кандидат в GLEIF по названию"}
+    for row in report["registry"]:
+        print(f"  {row['id']} · {states[row['status']]} · {row.get('name') or row.get('error') or ''}".rstrip(" ·"))
+        details = " · ".join(row[k] for k in ("form", "state", "jurisdiction", "registered") if row.get(k))
+        if details:
+            print("  " + details)
+        if row.get("activity"):
+            print(f"  {row.get('activity_type', 'Деятельность')} · {row['activity']}")
+        if row.get("source"):
+            print(f"  Источник · {row['source']}")
+        if row.get("official"):
+            print(f"  Официальная сверка · {row['official']}")
+    if not report["registry"]:
+        print("  Регистрационный номер не известен. Сайт или ник не доказывает регистрацию.")
+    print("\nСВЯЗИ И ИСТОЧНИКИ")
+    matched_phone = False
+    matched_nick = False
+    discovered_ids = set()
+    publications = {}
+    for row in report["pages"]:
+        print("  " + ("Указанный сайт" if row["source"] == "supplied" else "Кандидат из поиска") + " · " + row["url"])
+        if "error" in row:
+            print(f"    Не прочитан · {row['error']}")
+        elif not row["facts"]:
+            print("    Не найдены структурированные деловые реквизиты или публичные контактные ссылки.")
+        for kind, value in row.get("facts", []):
+            marker = ""
+            if kind == "phone" and value == seed["phone"]:
+                matched_phone = True
+                marker = " [совпадает с вводом]"
+            if kind == "profile" and value.rsplit("/", 1)[-1].lstrip("@").casefold() == seed["handle"]:
+                matched_nick = True
+                marker = " [ник совпадает с вводом]"
+            if kind in ("phone", "profile", "identifier"):
+                publications.setdefault((kind, value), set()).add(case_host(row["url"]))
+            if kind == "identifier":
+                discovered_ids.add(value)
+                if value == seed["registration"]:
+                    marker = " [совпадает с вводом]"
+            print(f"    {CASE_LABELS[kind]} · {value}{marker}")
+    if not report["pages"]:
+        print("  Подтверждённых публикаций нет в пределах этой проверки.")
+    if report.get("bill"):
+        print("\nЛОКАЛЬНЫЙ СЧЁТ · распознано, не подтверждено")
+        for kind, value in report["bill"]:
+            if kind == "identifier":
+                reference = seed["registration"]
+            else:
+                reference = seed["phone"]
+            verdict = ("совпадает с вводом" if value == reference else "не совпадает с вводом") if reference else ""
+            if (kind, value) in publications:
+                verdict = (verdict + " · " if verdict else "") + "также опубликовано на сайте"
+            label = "Реквизит" if kind == "identifier" else "Телефон"
+            print(f"  {label} · {value}" + (f" [{verdict}]" if verdict else ""))
+    print("\nВЫВОД")
+    if seed["phone"]:
+        print("  " + ("Введённый телефон опубликован на показанной странице." if matched_phone else
+                      "Публикация введённого телефона не подтверждена."))
+    if seed["handle"]:
+        print("  " + ("Найдена публичная ссылка с этим ником." if matched_nick else
+                      "Связь введённого ника с проверенными сайтами не подтверждена."))
+    reference_id = seed["registration"]
+    if reference_id:
+        comparable = {value for value in discovered_ids if len(value) == len(reference_id)}
+        if comparable and reference_id not in comparable:
+            print("  На сайте указан другой номер того же формата. Сверь его с реестром.")
+    for (kind, value), hosts in sorted(publications.items()):
+        if len(hosts) > 1:
+            print(f"  {CASE_LABELS[kind]} {value} опубликован на доменах {', '.join(sorted(hosts))}.")
+    if len(discovered_ids) > 1:
+        print("  На страницах несколько идентификаторов. Не объединяй компании по одному контакту.")
+    registry_found = any(r["status"] == "found" for r in report["registry"])
+    if registry_found and not discovered_ids:
+        print("  Компания найдена, но привязка проверенного сайта к записи реестра не видна.")
+    if not registry_found and not seed["registration"]:
+        print("  Следующий шаг · взять регистрационный номер из официальных реквизитов и повторить проверку.")
+    elif seed["sites"]:
+        print("  Следующий шаг · сверить контакт с независимо найденным официальным источником.")
+    if seed["phone"].startswith("+31"):
+        print("  Ручная проверка сообщений · https://www.politie.nl/aangifte-of-melding-doen/controleer-handelspartij.html/")
+    print("  Публикация контакта не доказывает, кто тебе пишет или принимает оплату.")
+    if "changes" in report:
+        print("\nИЗМЕНЕНИЯ")
+        for change in report["changes"]:
+            print("  " + change)
+    for note in report["notes"]:
+        print("  " + note)
+
+
+def case_investigate(opts):
+    if opts.case and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", opts.case):
+        raise UserError("Имя истории должно состоять из букв A–Z, цифр, дефиса или подчёркивания.")
+    report = case_collect(opts)
+    if opts.case:
+        folder = STATE / "investigations"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        filename = folder / (opts.case + ".json")
+        if filename.is_file():
+            try:
+                with filename.open("rb") as f:
+                    previous = json.loads(f.read(2 * CASE_MAX_BODY))
+                report["changes"] = case_changes(previous, report)
+            except (OSError, ValueError, TypeError, KeyError):
+                report["notes"].append("Предыдущий снимок не удалось прочитать.")
+        atomic_write(filename, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        report["notes"].append(f"Локальный снимок · {filename}")
+    if opts.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        case_present(report)
+
+
 SCYTHE = r"""
     @@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%&&&&&&
   @@@╯         ╰───────────────╮      ╲&&&
@@ -1785,6 +2574,32 @@ class SharkConsole:
             ("Терминал коробки", self.open_box_shell),
         ))
 
+    def investigate(self):
+        title = "Расследование / Компания"
+        self.frame(title, ("Проверка публичных деловых реквизитов.",
+                           "Заполни то, что известно. Enter пропускает поле.", ""))
+        fields = (("--handle", "Деловой @ник"), ("--phone", "Рабочий телефон (+код)"),
+                  ("--site", "Сайт или страница компании"), ("--company", "Название компании"),
+                  ("--registration", "ИНН юрлица / ОГРН / номер LV / LEI"))
+        args = []
+        for flag, label in fields:
+            value = input(f"  {label} › ").strip()
+            if value:
+                args.append(f"{flag}={value}")
+        bill = input("  Путь к счёту TXT / фото [необязательно] › ").strip()
+        if bill:
+            args.append(f"--bill={bill}")
+        if not args:
+            return
+        if os.environ.get("PHONEHOST_BRAVE_KEY", "").strip():
+            answer = input("  Искать деловые страницы через Brave? [y/N] › ").strip().casefold()
+            if answer in ("y", "yes", "д", "да"):
+                args.append("--discover")
+        snapshot = input("  Имя истории [Enter — не сохранять] › ").strip()
+        if snapshot:
+            args.append(f"--case={snapshot}")
+        self.job(title, "investigate", *args)
+
     def options(self):
         self.pick("Инструменты Shark", (
             ("IP и локальная сеть", self.network),
@@ -1803,6 +2618,7 @@ class SharkConsole:
                 ("Управление сервером", self.servers),
                 ("Коробки Debian", self.boxes),
                 ("Инструменты Shark", self.options),
+                ("Расследование · номер, ник, компания", self.investigate),
             ), root=True)
         except EOFError:
             if not self.full:
@@ -1844,6 +2660,7 @@ def main(argv):
         args = guest()
         os.execv(args[0], args)
     menu = argparse.ArgumentParser(prog="phonehost", description="Debian-сервер внутри Termux. Android и прошивка не меняются.")
+    menu.add_argument("--version", action="version", version=f"PhoneHost {VERSION}")
     sub = menu.add_subparsers(dest="cmd")
     p = sub.add_parser("install", help="установить Debian и Nginx")
     p.add_argument("--web-port", type=int_range(1024, 65535))
@@ -1856,6 +2673,16 @@ def main(argv):
     sub.add_parser("status", help="проверить службы и показать IP и порты")
     p = sub.add_parser("console", help="открыть интерактивную панель Shark")
     p.add_argument("--root-network", action="store_true", help="разрешить чтение системных данных сети через su")
+    p = sub.add_parser("investigate", help="деловая проверка по сайту, рабочему номеру, нику и реестрам")
+    p.add_argument("--handle", help="публичный деловой @ник")
+    p.add_argument("--phone", help="рабочий телефон с международным кодом")
+    p.add_argument("--company", help="название компании для сверки и веб-поиска")
+    p.add_argument("--site", action="append", help="сайт компании, до двух адресов")
+    p.add_argument("--registration", help="ИНН юрлица, ОГРН, регистрационный номер LV или LEI")
+    p.add_argument("--bill", type=Path, help="сверить реквизиты локального счёта в TXT или фото")
+    p.add_argument("--discover", action="store_true", help="искать деловые страницы через Brave с API-ключом")
+    p.add_argument("--case", help="имя локальной истории для сравнения проверок")
+    p.add_argument("--json", action="store_true", help="вывести структурированный JSON-отчёт")
     p = sub.add_parser("network", help="посмотреть текущий Wi-Fi или свою точку доступа")
     p.add_argument("kind", choices=("wifi", "hotspot"))
     p.add_argument("--root", action="store_true", help="только чтение системных данных через su")
@@ -1931,6 +2758,8 @@ def main(argv):
         status()
     elif opts.cmd == "console":
         SharkConsole(opts.root_network).run()
+    elif opts.cmd == "investigate":
+        case_investigate(opts)
     elif opts.cmd == "network":
         network_inventory(opts.kind, opts.root)
     elif opts.cmd == "quick-server":
@@ -1982,5 +2811,9 @@ PHONEHOST_PY
 
 chmod 700 "$launcher"
 mv -f -- "$launcher" "$PREFIX/bin/phonehost"
+if [ "$#" -eq 1 ] && [ "$1" = "--launcher-only" ]; then
+  printf '\nPhoneHost 0.6 · команда обновлена. Открой панель: phonehost console\n'
+  exit 0
+fi
 export PHONEHOST_BOOTSTRAP_SECS="$SECONDS"
 exec "$PREFIX/bin/phonehost" install "$@"
