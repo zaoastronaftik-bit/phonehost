@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PhoneHost 0.3 • Debian on Termux, without flashing Android.
+# PhoneHost 0.4 • Debian on Termux, without flashing Android.
 set -euo pipefail
 umask 077
 
@@ -43,6 +43,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import statistics
 import subprocess
 import sys
@@ -50,9 +51,10 @@ import threading
 import time
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 INSTALL_SECONDS = 300
 PREFIX = Path(os.environ.get("PREFIX") or Path(__file__).resolve().parent.parent)
 STATE = Path.home() / ".phonehost"
@@ -61,6 +63,8 @@ IMAGE = "debian:trixie-slim"
 CONTROL = STATE / "run.sock"
 CONFIG = STATE / "config.json"
 SERVICES = STATE / "services.json"
+BOXES = STATE / "boxes.json"
+BOX_CONFIG = "/opt/phonebox/nginx.conf"
 MARKER = STATE / "container-owned"
 HEALTH = "/__phonehost_health"
 HEALTH_BODY = b"phonehost-ok"
@@ -70,6 +74,7 @@ GUEST_LOGS = "/var/log/phonehost"
 ACCESS = STATE / "nginx" / "access.jsonl"
 BASE_LOGS = ("access", "web", "ssh", "supervisor", "install", "boot")
 LOGO = "◢━━◣  PHONEHOST / SHARK"
+TOOL_PACKAGES = ("bind9-dnsutils", "jq", "openssl", "file", "libimage-exiftool-perl")
 FILE_SCRIPT = r"""set -eu
 case "$1" in
     root) root=/root/phonehost ;;
@@ -127,12 +132,12 @@ def binary(name):
     return str(PREFIX / "bin" / name)
 
 
-def guest(*args, logs=False):
+def guest(*args, logs=False, container=CONTAINER):
     command = [binary("proot-distro"), "login", "--isolated"]
     if logs:
         ACCESS.parent.mkdir(exist_ok=True, mode=0o700)
         command += ["--bind", f"{ACCESS.parent}:{GUEST_LOGS}"]
-    command.append(CONTAINER)
+    command.append(container)
     return command + ["--", *args] if args else command
 
 
@@ -162,6 +167,149 @@ def read_config():
 
 def read_services():
     return json.loads(SERVICES.read_text(encoding="utf-8")) if SERVICES.exists() else {}
+
+
+def read_boxes():
+    try:
+        return json.loads(BOXES.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def box_stamp():
+    try:
+        return BOXES.stat().st_mtime_ns
+    except FileNotFoundError:
+        return 0
+
+
+def box_ip(box):
+    return f"127.77.0.{box['slot']}"
+
+
+def box_tag(name):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,23}", name):
+        raise UserError("Имя коробки: до 24 строчных латинских букв, цифр и дефисов, сначала буква.")
+    return "phonebox-" + name
+
+
+def check_box_ports(*ports):
+    occupied = {box["port"] for box in read_boxes().values()}
+    if occupied.intersection(ports):
+        raise UserError("Этот порт выделен локальной коробке. Выбери другой порт PhoneHost.")
+
+
+def box_specs():
+    return {"box-" + name: guest("/usr/sbin/nginx", "-c", BOX_CONFIG, container=box_tag(name))
+            for name, box in read_boxes().items() if box["ready"] and box["enabled"]}
+
+
+def box_setup_script(name, address, port):
+    return f"""set -eu
+if [ ! -x /usr/sbin/nginx ]; then
+    own_policy=0
+    if [ ! -e /usr/sbin/policy-rc.d ] && [ ! -L /usr/sbin/policy-rc.d ]; then
+        printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+        chmod 755 /usr/sbin/policy-rc.d
+        own_policy=1
+    fi
+    trap '[ "$own_policy" = 0 ] || rm -f /usr/sbin/policy-rc.d' EXIT
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends nginx ca-certificates
+fi
+mkdir -p /opt/phonebox /srv/phonebox/www /run /var/lib/nginx
+next=$(mktemp /opt/phonebox/.nginx.XXXXXX)
+cat > "$next" <<'NGINX'
+daemon off;
+master_process off;
+worker_processes 1;
+pid /run/phonebox-nginx.pid;
+error_log stderr notice;
+events {{ worker_connections 256; }}
+http {{
+    include /etc/nginx/mime.types;
+    access_log off;
+    server_tokens off;
+    server {{
+        listen {address}:{port};
+        root /srv/phonebox/www;
+        index index.html;
+        location = {HEALTH} {{ return 200 "{HEALTH_BODY.decode()}"; }}
+        location / {{ try_files $uri $uri/ =404; }}
+    }}
+}}
+NGINX
+/usr/sbin/nginx -t -c "$next" || {{ rm -f "$next"; exit 1; }}
+mv -f "$next" {BOX_CONFIG}
+if [ ! -e /srv/phonebox/www/index.html ]; then
+    printf '%s\n' '<!doctype html><html><meta charset="utf-8"><title>{name} · PhoneBox</title><h1>{name}</h1><p>PhoneBox · {address}:{port}</p></html>' \
+        > /srv/phonebox/www/index.html
+fi
+"""
+
+
+def manage_box(action, name=None):
+    conf = read_config()
+    if action == "list":
+        boxes = read_boxes()
+        workers = (rpc("status") or {}).get("workers", {})
+        if not boxes:
+            print("Коробок пока нет. Создать: phonehost box create myapp")
+        for item, box in sorted(boxes.items()):
+            state = ("процесс запущен" if workers.get("box-" + item) else "ожидает запуска") if box["enabled"] else "остановлена"
+            print(f"  {item:24} http://{box_ip(box)}:{box['port']}  {state if box['ready'] else 'не завершена установка'}")
+        return
+    tag = box_tag(name)
+    with serial():
+        boxes = read_boxes()
+        box = boxes.get(name)
+        if action == "create":
+            if box is not None and box["ready"]:
+                raise UserError(f"Коробка {name} уже существует.")
+            exists = subprocess.run(guest("/usr/bin/test", "-r", "/etc/debian_version", container=tag),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            if box is None:
+                if exists:
+                    raise UserError(f"Среда {tag} не принадлежит PhoneHost.")
+                used = {row["slot"] for row in boxes.values()}
+                slot = next((i for i in range(2, 255) if i not in used), None)
+                if slot is None:
+                    raise UserError("В пуле локальных адресов не осталось свободных мест.")
+                port = next(p for p in (8177, 8178, 8179) if p not in (conf["web_port"], conf["ssh_port"]))
+                box = {"slot": slot, "port": port, "ready": False, "enabled": False}
+                port_free(port, box_ip(box))
+                boxes[name] = box
+                atomic_write(BOXES, json.dumps(boxes) + "\n")
+            if not exists:
+                subprocess.run(debian_install_command(STATE / "install.log", tag), check=True)
+            subprocess.run(guest("/bin/sh", "-s", container=tag),
+                           input=box_setup_script(name, box_ip(box), box["port"]), text=True, check=True)
+            box["ready"] = True
+            atomic_write(BOXES, json.dumps(boxes) + "\n")
+            print(f"Коробка {name} готова · http://{box_ip(box)}:{box['port']}")
+            return
+        if box is None or not box["ready"]:
+            raise UserError("Коробка не готова. Сначала выполни phonehost box create.")
+        if action in ("start", "stop"):
+            if action == "start" and not box["enabled"]:
+                port_free(box["port"], box_ip(box))
+            box["enabled"] = action == "start"
+            atomic_write(BOXES, json.dumps(boxes) + "\n")
+            if action == "start" and not rpc("status"):
+                launch_box_manager()
+    if action == "shell":
+        subprocess.run(guest(container=tag), check=True)
+    elif action == "stop":
+        print(f"Остановка коробки {name} запрошена.")
+    else:
+        until = time.monotonic() + 12
+        while time.monotonic() < until:
+            if probe_web(box["port"], host=box_ip(box)):
+                print(f"Коробка на связи · http://{box_ip(box)}:{box['port']}")
+                return
+            time.sleep(0.35)
+        raise UserError(f"Коробка не ответила. Посмотри phonehost logs box-{name}.")
 
 
 def manage_service(action, name=None, script=None):
@@ -360,7 +508,7 @@ fi
     return data
 
 
-def debian_install_command(log):
+def debian_install_command(log, container=CONTAINER):
     pd = binary("proot-distro")
     result = subprocess.run([pd, "install", "--help"], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
@@ -370,9 +518,9 @@ def debian_install_command(log):
     if result.returncode != 0:
         raise UserError(f"Не удалось получить справку proot-distro (код {result.returncode}). Журнал: phonehost logs install.")
     if re.search(r"(?<![\w-])--name\b", help_text):
-        return [pd, "install", "--name", CONTAINER, IMAGE]
+        return [pd, "install", "--name", container, IMAGE]
     if re.search(r"(?<![\w-])--override-alias\b", help_text):
-        return [pd, "install", "--override-alias", CONTAINER, "debian"]
+        return [pd, "install", "--override-alias", container, "debian"]
     raise UserError("В справке proot-distro не нашлись параметры имени контейнера. Журнал: phonehost logs install.")
 
 
@@ -385,6 +533,7 @@ def install(opts):
         ssh_port = opts.ssh_port or old.get("ssh_port", 8022)
         if web_port == ssh_port:
             raise UserError("Для HTTP и SSH нужны разные порты.")
+        check_box_ports(web_port, ssh_port)
         if shutil.disk_usage(STATE).free < 800 * 1024**2:
             print("PhoneHost: свободно меньше 800 МБ. Образ и пакеты могут не поместиться.", file=sys.stderr)
         ui = Shark(opts.verbose)
@@ -401,30 +550,30 @@ def install(opts):
             ui.run(3, "Debian · скачиваем и распаковываем образ", debian_install_command(ui.log))
             atomic_write(MARKER, "phonehost\n")
         ui.run(4, "Debian · индекс пакетов", guest("/usr/bin/apt-get", "update"))
-        ui.run(5, "Debian · устанавливаем Nginx и сертификаты", guest("/bin/sh", "-s"), """set -eu
+        ui.run(5, "Debian · Nginx, сертификаты и инструменты", guest("/bin/sh", "-s"), f"""set -eu
 own_policy=0
 if [ ! -e /usr/sbin/policy-rc.d ] && [ ! -L /usr/sbin/policy-rc.d ]; then
     printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
     chmod 755 /usr/sbin/policy-rc.d
     own_policy=1
 fi
-cleanup() {
+cleanup() {{
     if [ "$own_policy" = 1 ]; then rm -f /usr/sbin/policy-rc.d; fi
-}
+}}
 trap cleanup EXIT
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y --no-install-recommends nginx ca-certificates
+apt-get install -y --no-install-recommends nginx ca-certificates {' '.join(TOOL_PACKAGES)}
 mkdir -p /var/log/phonehost
 """)
         ui.run(6, "Nginx · сайт, журналы и личная папка", guest("/bin/sh", "-s", logs=True), web_setup(web_port, prepare=True))
         atomic_write(CONFIG, json.dumps({"web_port": web_port, "ssh_port": ssh_port}) + "\n")
         ui.finish(opts.fast)
-    print("\n  [━━━━━━━━━━━━]  ГОТОВО\n\n  phonehost start  ·  запуск\n  phonehost shell  ·  вход в Debian\n  phonehost --help ·  все команды")
+    print("\n  [━━━━━━━━━━━━]  ГОТОВО\n\n  phonehost console · панель\n  phonehost start · запуск\n  phonehost shell · вход в Debian")
     print(f"\n  Полный лог: {ui.log}\n")
 
 
-def probe_web(port, timeout=0.7):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+def probe_web(port, timeout=0.7, host="127.0.0.1"):
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         conn.request("GET", HEALTH, headers={"Connection": "close"})
         res = conn.getresponse()
@@ -452,7 +601,7 @@ def rpc(message):
             client.connect(str(CONTROL))
             client.sendall(message.encode("ascii") + b"\n")
             with client.makefile("rb") as response:
-                line = response.readline(4096)
+                line = response.readline(65536)
             return json.loads(line) if line else None
     except (OSError, ValueError):
         return None
@@ -483,17 +632,38 @@ def start_child(name, argv):
         return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=file, stderr=file, start_new_session=True)
 
 
-def supervise():
+def launch_box_manager():
+    proc = start_child("supervisor", [sys.executable, str(Path(__file__).resolve()), "_supervise_boxes"])
+    limit = time.monotonic() + 5
+    while time.monotonic() < limit:
+        if rpc("status"):
+            return
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    stop_children([proc])
+    raise UserError("Локальный менеджер не запустился. Посмотри phonehost logs supervisor.")
+
+
+def supervise(boxes_only=False):
     config = read_config()
     CONTROL.unlink(missing_ok=True)
     running = True
     children = {}
     retry = {}
-    specs = {"web": guest("/usr/sbin/nginx", "-c", GUEST_WEB, logs=True)}
-    for name, path in read_services().items():
-        specs["app-" + name] = guest("/bin/sh", path)
-    if (STATE / "authorized_keys").is_file():
-        specs["ssh"] = [binary("sshd"), "-D", "-e", "-f", str(STATE / "sshd_config")]
+    specs = {}
+    mode = "boxes" if boxes_only else "all"
+    box_version = -1
+
+    def base_specs():
+        if mode == "boxes":
+            return {}
+        base = {"web": guest("/usr/sbin/nginx", "-c", GUEST_WEB, logs=True)}
+        for name, path in read_services().items():
+            base["app-" + name] = guest("/bin/sh", path)
+        if (STATE / "authorized_keys").is_file():
+            base["ssh"] = [binary("sshd"), "-D", "-e", "-f", str(STATE / "sshd_config")]
+        return base
 
     def halt(*_):
         nonlocal running
@@ -507,6 +677,14 @@ def supervise():
             server.listen(4)
             server.settimeout(0.3)
             while running:
+                stamp = box_stamp()
+                if stamp != box_version:
+                    desired = {**base_specs(), **box_specs()}
+                    for name in specs.keys() - desired.keys():
+                        if name in children:
+                            stop_children([children.pop(name)])
+                        retry.pop(name, None)
+                    specs, box_version = desired, stamp
                 for name, argv in specs.items():
                     proc = children.get(name)
                     if (proc is None or proc.poll() is not None) and time.monotonic() >= retry.get(name, 0):
@@ -526,8 +704,11 @@ def supervise():
                             cmd = stream.readline(64)
                         if cmd == b"stop\n":
                             halt()
+                        elif cmd in (b"web-start\n", b"web-stop\n"):
+                            mode = "all" if cmd == b"web-start\n" else "boxes"
+                            box_version = -1
                         active = {name: name in children and children[name].poll() is None for name in specs}
-                        payload = {"running": running, "workers": active, "ports": config}
+                        payload = {"running": running, "workers": active, "ports": config, "mode": mode}
                         conn.sendall(json.dumps(payload).encode() + b"\n")
                     except OSError:
                         pass
@@ -536,13 +717,13 @@ def supervise():
         CONTROL.unlink(missing_ok=True)
 
 
-def port_free(port):
+def port_free(port, host="0.0.0.0"):
     with socket.socket() as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind(("0.0.0.0", port))
+            sock.bind((host, port))
         except OSError as exc:
-            raise UserError(f"Не могу открыть порт {port}: {exc.strerror}") from exc
+            raise UserError(f"Не могу открыть порт {port} на {host}: {exc.strerror}") from exc
 
 
 def update_ports(web, ssh):
@@ -554,6 +735,7 @@ def update_ports(web, ssh):
                 raise UserError("Сначала останови PhoneHost: phonehost stop.")
             if selected["web_port"] == selected["ssh_port"]:
                 raise UserError("Для HTTP и SSH нужны разные порты.")
+            check_box_ports(*selected.values())
             for key, port in selected.items():
                 if port != config[key]:
                     port_free(port)
@@ -584,7 +766,8 @@ def guest_files(options):
 def start():
     with serial():
         conf = read_config()
-        if rpc("status"):
+        running = rpc("status")
+        if running and running.get("mode") != "boxes":
             print("PhoneHost уже запущен. Подробности: phonehost status.")
             return
         port_free(conf["web_port"])
@@ -592,18 +775,24 @@ def start():
         if with_ssh:
             port_free(conf["ssh_port"])
             render_sshd(conf["ssh_port"])
-        proc = start_child("supervisor", [sys.executable, str(Path(__file__).resolve()), "_supervise"])
+        if running:
+            if not rpc("web-start"):
+                raise UserError("Менеджер коробок не ответил.")
+            proc = None
+        else:
+            proc = start_child("supervisor", [sys.executable, str(Path(__file__).resolve()), "_supervise"])
         deadline = time.monotonic() + 18
         while time.monotonic() < deadline:
             if (rpc("status") and probe_web(conf["web_port"])
                     and (not with_ssh or probe_ssh(conf["ssh_port"]))):
                 status()
                 return
-            if proc.poll() is not None:
+            if proc is not None and proc.poll() is not None:
                 break
             time.sleep(0.25)
-        called = rpc("stop")
-        if called is None:
+        if proc is None:
+            rpc("web-stop")
+        elif rpc("stop") is None:
             stop_children([proc])
         raise UserError("Сервисы не ответили после запуска. Проверь phonehost logs web, ssh и supervisor.")
 
@@ -642,6 +831,9 @@ def status():
     ssh_on = "ssh" in running["workers"]
     ssh_ok = ssh_on and running["workers"]["ssh"] and probe_ssh(conf["ssh_port"])
     print(f"PhoneHost {VERSION} · Debian в Termux")
+    if running.get("mode") == "boxes":
+        print("  Менеджер коробок запущен. Основной HTTP-сервер и SSH выключены.")
+        return
     print(f"  HTTP  {'OK' if web_ok else 'нет ответа'}   http://127.0.0.1:{conf['web_port']}")
     if ip and ip != "127.0.0.1":
         print(f"  IPv4 выбранной сети   http://{ip}:{conf['web_port']}")
@@ -775,9 +967,10 @@ def bench(count, workers):
 def log_paths(name):
     if name == "all":
         live = (p.name[:-4] for p in sorted(STATE.glob("app-*.log")))
-        names = dict.fromkeys((*BASE_LOGS, *("app-" + n for n in read_services()), *live))
+        names = dict.fromkeys((*BASE_LOGS, *("app-" + n for n in read_services()),
+                               *("box-" + n for n in read_boxes()), *live))
         return {n: ACCESS if n == "access" else STATE / (n + ".log") for n in names}
-    if name not in BASE_LOGS and not re.fullmatch(r"app-[a-z][a-z0-9-]{0,31}", name):
+    if name not in BASE_LOGS and not re.fullmatch(r"(?:app|box)-[a-z][a-z0-9-]{0,31}", name):
         raise UserError("Неизвестный журнал. Пример: phonehost logs access.")
     return {name: ACCESS if name == "access" else STATE / (name + ".log")}
 
@@ -1044,12 +1237,13 @@ def toolbox(opts):
         print("dns    DNS-записи · dig из Debian")
         print("rdap   Регистрация публичного IP · IANA/RDAP")
         print("hash   SHA-256 локального файла · Python")
-        print("install  Пакеты bind9-dnsutils, jq и openssl в Debian")
+        print("console  Инвентарь, TLS, формат файла, EXIF и управление")
+        print("install  Восстановить стандартный набор пакетов Debian")
     elif opts.action == "install":
         read_config()
         subprocess.run(guest("/usr/bin/apt-get", "update"), check=True)
         subprocess.run(guest("/usr/bin/apt-get", "install", "-y", "--no-install-recommends",
-                             "bind9-dnsutils", "jq", "openssl"), check=True)
+                             *TOOL_PACKAGES), check=True)
     elif opts.action == "dns":
         read_config()
         domain = dns_domain(opts.domain)
@@ -1068,11 +1262,281 @@ def toolbox(opts):
         print(f"{digest.hexdigest()}  {clean(str(opts.path))}")
 
 
+def public_address():
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, *_args):
+            raise UserError("Проверка внешнего IP неожиданно попросила перенаправление.")
+
+    print("Внешняя проверка · запрос к api64.ipify.org", flush=True)
+    with build_opener(NoRedirect()).open("https://api64.ipify.org?format=json", timeout=8) as response:
+        payload = json.loads(response.read(2048))
+    address = ipaddress.ip_address(payload["ip"])
+    print(f"IP, который увидел сервис: {address}")
+
+
+def local_network():
+    print("Адрес выбранного маршрута: " + (current_ip() or "недоступен"))
+    ip_tool = Path("/system/bin/ip") if Path("/system/bin/ip").is_file() else shutil.which("ip")
+    if not ip_tool:
+        print("Системная команда маршрутов недоступна.")
+        return
+    result = subprocess.run([str(ip_tool), "-4", "route", "show", "default"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=4)
+    routes = result.stdout.splitlines() if result.returncode == 0 else []
+    if not routes:
+        print("Android не показал маршрут по умолчанию. Адрес шлюза можно посмотреть в настройках сети.")
+    for route in routes:
+        fields = route.split()
+        if len(fields) >= 3 and fields[0:2] == ["default", "via"]:
+            print(f"Шлюз: {ipaddress.ip_address(fields[2])}")
+        if "dev" in fields and fields.index("dev") + 1 < len(fields):
+            print("Интерфейс: " + clean(fields[fields.index("dev") + 1]))
+
+
+def recent_clients(path, limit=1500):
+    counts, last = Counter(), {}
+    try:
+        file = path.open("rb")
+    except FileNotFoundError:
+        return []
+    with file:
+        file.seek(tail_start(file, limit))
+        for line in file:
+            try:
+                row = json.loads(line)
+                if row["path"] == HEALTH:
+                    continue
+                ip = str(ipaddress.ip_address(row["ip"]))
+                when = float(row["epoch"])
+                if not math.isfinite(when) or not 0 <= when < 253402300799:
+                    continue
+            except (ValueError, TypeError, KeyError):
+                continue
+            counts[ip] += 1
+            last[ip] = max(last.get(ip, 0), when)
+    return sorted(((ip, counts[ip], when) for ip, when in last.items()),
+                  key=lambda row: row[2], reverse=True)
+
+
+def show_clients():
+    rows = recent_clients(ACCESS)
+    print(f"Уникальных адресов в последних 1500 записях HTTP: {len(rows)}")
+    for ip, count, when in rows:
+        print(f"  {ip:39} {count:5}  {time.strftime('%d.%m %H:%M:%S', time.localtime(when))}")
+    print("Это клиенты PhoneHost, а не список всех устройств Wi-Fi.")
+
+
+def own_leases(path, now):
+    with path.open("rb") as f:
+        raw = f.read(512 * 1024 + 1)
+    if len(raw) > 512 * 1024:
+        raise UserError("Файл аренд превышает 512 КБ.")
+    rows = {}
+    local_ranges = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"))
+    for line in raw.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        try:
+            expiry, address = int(parts[0]), ipaddress.ip_address(parts[2])
+        except ValueError:
+            continue
+        if (expiry == 0 or expiry > now) and any(address in network for network in local_ranges):
+            rows[address] = clean(parts[3])[:48] if parts[3] != "*" else ""
+    return sorted(rows.items(), key=lambda row: (row[0].version, int(row[0])))
+
+
+def show_leases(path):
+    rows = own_leases(path, time.time())
+    for ip, name in rows:
+        print(f"  {str(ip):39} {name or '—'}")
+    print(f"Действующих аренд: {len(rows)}. Аренда не означает, что устройство сейчас на связи.")
+
+
+def subnet_info(raw):
+    interface = ipaddress.ip_interface(raw)
+    net = interface.network
+    print(f"IP      {interface.ip}")
+    print(f"Подсеть {net}  ·  {net.num_addresses:,} адресов")
+    print(f"Первый и последний адрес: {net.network_address} — {net.broadcast_address}")
+
+
+def reverse_dns(raw):
+    read_config()
+    address = ipaddress.ip_address(raw)
+    if not address.is_global or address.is_multicast or getattr(address, "scope_id", None):
+        raise UserError("Для локальных адресов используй таблицу своего роутера.")
+    subprocess.run(guest("/usr/bin/dig", "-x", str(address), "+time=3", "+tries=1",
+                         "+noall", "+comments", "+answer"), timeout=15, check=True)
+
+
+def check_tls(raw):
+    domain = dns_domain(raw).rstrip(".")
+    context = ssl.create_default_context()
+    with socket.create_connection((domain, 443), timeout=8) as connection:
+        with context.wrap_socket(connection, server_hostname=domain) as tls:
+            cert = tls.getpeercert()
+            digest = hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
+            print(f"{domain} · {tls.version()} · сертификат проверен")
+            print(f"Действует до: {cert.get('notAfter', 'не указано')}")
+            print(f"SHA-256: {digest}")
+
+
+def inspect_file(path, metadata=False):
+    read_config()
+    if not path.is_file():
+        raise UserError("Укажи обычный файл в Termux.")
+    args = ("/usr/bin/exiftool", "-fast2", "-s", "-FileType", "-ImageSize",
+            "-DateTimeOriginal", "-Make", "-Model", "-Software", "-GPSLatitude",
+            "-GPSLongitude", "-") if metadata else ("/usr/bin/file", "-b", "--mime-type", "-")
+    with path.open("rb") as file:
+        result = subprocess.run(guest(*args), stdin=file, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=40)
+    for line in (result.stdout + result.stderr).splitlines():
+        if clean(line):
+            print(clean(line)[:240])
+    if result.returncode:
+        raise UserError(f"Инструмент завершился с кодом {result.returncode}.")
+    if metadata and not result.stdout.strip():
+        print("Из выбранных метаданных ничего не найдено.")
+
+
+SCYTHE = r"""
+    @@@@@@@@@%%%%%%%%%%%%%%%%%%%%%%&&&&&&
+  @@@╯         ╰───────────────╮      ╲&&&
+                                ╲      ╲&&
+           P H O N E H O S T     ╲      #&
+             S H A R K            ╲     #&
+                                   ╲   ##
+                                    ╲##╯
+                                     ║
+                                     ║
+"""
+
+
+class MenuBack(Exception):
+    pass
+
+
+class SharkConsole:
+    def prompt(self, label):
+        value = input(f"  {label} › ").strip()
+        if not value:
+            raise MenuBack()
+        return value
+
+    def pick(self, title, items, root=False):
+        while True:
+            print(f"\n╭━━ {title} {'━' * max(2, 32 - len(title))}╮")
+            for index, (label, _) in enumerate(items, 1):
+                print(f"│ {index:2}. {label}")
+            print(f"│  0. {'Выход' if root else 'Назад'}")
+            print("╰" + "━" * 36 + "╯")
+            value = input("  SHARK › ").strip()
+            if value == "0":
+                return
+            if not value.isascii() or not value.isdecimal() or len(value) > 2 or not 1 <= int(value) <= len(items):
+                print("  Выбери номер из меню.")
+                continue
+            try:
+                items[int(value) - 1][1]()
+            except MenuBack:
+                pass
+            except KeyboardInterrupt:
+                print("\n  Действие остановлено.")
+            except (UserError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+                print("  ! " + clean(str(exc)))
+
+    def path(self):
+        return Path(self.prompt("Путь к файлу")).expanduser()
+
+    def network(self):
+        self.pick("IP / Локальная сеть", (
+            ("Мои адрес и шлюз", local_network),
+            ("Мой внешний IP", public_address),
+            ("Кто обращался к PhoneHost", show_clients),
+            ("Аренды DHCP своего роутера", lambda: show_leases(self.path())),
+            ("Калькулятор подсети", lambda: subnet_info(self.prompt("IP/маска, например 192.168.1.42/24"))),
+        ))
+
+    def lookup(self):
+        def dns():
+            domain = self.prompt("Домен")
+            kind = input("  Тип записи [A] › ").strip().upper() or "A"
+            if kind not in DNS_TYPES:
+                raise UserError("Доступны " + ", ".join(DNS_TYPES))
+            toolbox(SimpleNamespace(action="dns", domain=domain, type=kind))
+        self.pick("DNS / Реестры / TLS", (
+            ("Записи домена", dns),
+            ("Владелец диапазона публичного IP", lambda: rdap_lookup(self.prompt("Публичный IP"))),
+            ("Обратная DNS-запись", lambda: reverse_dns(self.prompt("Публичный IP"))),
+            ("Проверка TLS-сертификата", lambda: check_tls(self.prompt("Домен"))),
+        ))
+
+    def files(self):
+        self.pick("Анализ файлов", (
+            ("Отпечаток SHA-256", lambda: toolbox(SimpleNamespace(action="hash", path=self.path()))),
+            ("Распознать формат", lambda: inspect_file(self.path())),
+            ("Прочитать метаданные своего файла", lambda: inspect_file(self.path(), metadata=True)),
+        ))
+
+    def services(self):
+        self.pick("Мои проекты", (
+            ("Список служб", lambda: manage_service("list")),
+            ("Добавить службу", lambda: manage_service("add", self.prompt("Имя"),
+                                                        self.prompt("Абсолютный путь к стартовому скрипту в Debian"))),
+            ("Убрать из запуска", lambda: manage_service("remove", self.prompt("Имя службы"))),
+        ))
+
+    def servers(self):
+        def restart():
+            stop()
+            start()
+        self.pick("Управление PhoneHost", (
+            ("Запустить сервер", start),
+            ("Остановить сервер", stop),
+            ("Перезапустить сервер", restart),
+            ("Статус и адреса", status),
+            ("Мои фоновые службы", self.services),
+            ("Статистика HTTP за час", lambda: traffic(60, 10)),
+        ))
+
+    def boxes(self):
+        actions = (("Создать отдельный Debian", "create"), ("Запустить коробку", "start"),
+                   ("Остановить коробку", "stop"), ("Терминал коробки", "shell"))
+        self.pick("Коробки Debian", (
+            ("Список и локальные адреса", lambda: manage_box("list")),
+            *((label, lambda action=action: manage_box(action, self.prompt("Имя коробки")))
+              for label, action in actions),
+        ))
+
+    def run(self):
+        if sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ:
+            print("\033[38;5;80m" + SCYTHE + "\033[0m", end="")
+        else:
+            print(SCYTHE, end="")
+        print(f"  SHARK CONSOLE · {VERSION} · # @ % &")
+        try:
+            self.pick("Пульт управления", (
+                ("IP и локальная сеть", self.network),
+                ("Домены, реестры и сертификаты", self.lookup),
+                ("Анализ файлов", self.files),
+                ("Управление сервером", self.servers),
+                ("Коробки Debian", self.boxes),
+                ("Диагностика устройства", doctor),
+            ), root=True)
+        except EOFError:
+            print()
+
+
+DNS_TYPES = ("A", "AAAA", "MX", "NS", "TXT", "CAA", "SOA")
+
+
 def main(argv):
     os.umask(0o077)
     raw = argv[0] if argv else ""
-    if raw == "_supervise":
-        supervise()
+    if raw in ("_supervise", "_supervise_boxes"):
+        supervise(boxes_only=raw == "_supervise_boxes")
         return
     if raw == "_shell_remote":
         if os.environ.get("SSH_ORIGINAL_COMMAND") or not os.environ.get("SSH_TTY"):
@@ -1092,6 +1556,12 @@ def main(argv):
     sub.add_parser("stop", help="остановить службы PhoneHost")
     sub.add_parser("restart", help="перезапустить службы PhoneHost")
     sub.add_parser("status", help="проверить службы и показать IP и порты")
+    sub.add_parser("console", help="открыть интерактивную панель Shark")
+    boxes = sub.add_parser("box", help="отдельные среды Debian и локальные веб-серверы")
+    box_commands = boxes.add_subparsers(dest="action", required=True)
+    box_commands.add_parser("list", help="список коробок")
+    for verb in ("create", "start", "stop", "shell"):
+        box_commands.add_parser(verb).add_argument("name")
     sub.add_parser("doctor", help="показать архитектуру, память, место и состояние служб")
     sub.add_parser("shell", help="открыть локальный терминал Debian")
     p = sub.add_parser("ssh-key", help="добавить публичный ключ для SSH")
@@ -1139,7 +1609,7 @@ def main(argv):
     tools.add_parser("install", help="установить диагностические пакеты Debian")
     dns = tools.add_parser("dns", help="посмотреть DNS-записи домена")
     dns.add_argument("domain")
-    dns.add_argument("--type", default="A", choices=("A", "AAAA", "MX", "NS", "TXT", "CAA", "SOA"))
+    dns.add_argument("--type", default="A", choices=DNS_TYPES)
     tools.add_parser("rdap", help="найти регистрацию публичного IP").add_argument("ip")
     tools.add_parser("hash", help="посчитать SHA-256 файла в Termux").add_argument("path", type=Path)
     opts = menu.parse_args(argv)
@@ -1155,6 +1625,10 @@ def main(argv):
         start()
     elif opts.cmd == "status":
         status()
+    elif opts.cmd == "console":
+        SharkConsole().run()
+    elif opts.cmd == "box":
+        manage_box(opts.action, getattr(opts, "name", None))
     elif opts.cmd == "doctor":
         doctor()
     elif opts.cmd == "shell":
@@ -1181,6 +1655,8 @@ def main(argv):
         manage_service(opts.action, getattr(opts, "name", None), getattr(opts, "script", None))
     elif opts.cmd == "toolbox":
         toolbox(opts)
+    elif sys.stdin.isatty() and sys.stdout.isatty():
+        SharkConsole().run()
     else:
         menu.print_help()
 
@@ -1188,7 +1664,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         main(sys.argv[1:])
-    except (UserError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+    except (UserError, OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"PhoneHost: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
