@@ -39,7 +39,7 @@ PAGE = '''<!DOCTYPE html>
 def opts(**overrides):
     return argparse.Namespace(**dict({"company": "", "phone": "+37120001000", "handle": "@demo_shop",
                                       "registration": "", "site": [DOMAIN], "discover": False,
-                                      "bill": None, "case": None, "json": False}, **overrides))
+                                      "bill": None, "case": None, "json": False, "profiles": False, "profile_report": None}, **overrides))
 
 
 class Investigate(unittest.TestCase):
@@ -92,10 +92,10 @@ class Investigate(unittest.TestCase):
         other = "https://www.other-shop.org/"
         third = "https://www.third-shop.org/"
         with patch.object(ph, "case_discovery", return_value=([other, third], None)), \
-             patch.object(ph, "case_html", side_effect=[
-                 (other, PAGE),
-                 (third, PAGE.replace("demo_shop", "unrelated").replace("+371 2000 1000", "+371 2000 1001")),
-             ]), patch.object(ph, "case_registry", return_value={"status": "found"}):
+             patch.object(ph, "case_html", side_effect=lambda url: (
+                 url, PAGE if url == other else PAGE.replace("demo_shop", "unrelated")
+                     .replace("+371 2000 1000", "+371 2000 1001").replace("+37120001000", "+37120001001")
+             )), patch.object(ph, "case_registry", return_value={"status": "found"}):
             report = ph.case_collect(opts(site=[], discover=True))
         self.assertEqual([p["url"] for p in report["pages"]], [other])
 
@@ -196,7 +196,7 @@ class Investigate(unittest.TestCase):
             script.write_text(PAYLOAD, encoding="utf-8")
             env = dict(ph.os.environ, HOME=tmp, PHONEHOST_BRAVE_KEY="", PHONEHOST_DADATA_KEY="")
             result = subprocess.run(["python3", str(script), "console"], env=env,
-                                    input="7\n\n\n\n\n7707083893\n\n\n\n0\n", text=True,
+                                    input="7\n\n\n\n\n7707083893\n\n\n\n\n0\n", text=True,
                                     capture_output=True, timeout=5, check=True)
         self.assertIn("Расследование", result.stdout)
         self.assertIn("Ручная проверка в ФНС", result.stdout)

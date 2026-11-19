@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PhoneHost 0.6 • Debian on Termux, without flashing Android.
+# PhoneHost 0.7 • Debian on Termux, without flashing Android.
 set -euo pipefail
 umask 077
 
@@ -27,12 +27,15 @@ import base64
 import binascii
 from collections import Counter, deque
 import contextlib
+import csv
 import fcntl
 import getpass
 import hashlib
 import http.client
 from html.parser import HTMLParser
 import ipaddress
+import io
+import itertools
 import json
 import math
 import os
@@ -42,6 +45,7 @@ import queue
 import random
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -59,7 +63,7 @@ from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit, urlunspli
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 INSTALL_SECONDS = 300
 PREFIX = Path(os.environ.get("PREFIX") or Path(__file__).resolve().parent.parent)
 STATE = Path.home() / ".phonehost"
@@ -1311,7 +1315,7 @@ def toolbox(opts):
         print(f"{digest.hexdigest()}  {clean(str(opts.path))}")
 
 
-def public_address():
+def public_ip():
     class NoRedirect(HTTPRedirectHandler):
         def redirect_request(self, *_args):
             raise UserError("Проверка внешнего IP неожиданно попросила перенаправление.")
@@ -1319,8 +1323,18 @@ def public_address():
     print("Внешняя проверка · запрос к api64.ipify.org", flush=True)
     with build_opener(NoRedirect()).open("https://api64.ipify.org?format=json", timeout=8) as response:
         payload = json.loads(response.read(2048))
-    address = ipaddress.ip_address(payload["ip"])
-    print(f"IP, который увидел сервис: {address}")
+    return ipaddress.ip_address(payload["ip"])
+
+
+def public_address():
+    print(f"IP, который увидел сервис: {public_ip()}")
+
+
+def ap_public_provider():
+    address = public_ip()
+    print(f"Внешний IP самого телефона · {address}")
+    print("Это адрес выхода Termux. Маршрут раздачи и подключённого устройства может отличаться.")
+    rdap_lookup(str(address))
 
 
 def local_network():
@@ -1445,21 +1459,227 @@ def network_inventory(mode, root=False):
         print_neighbours(iface, root)
         print("Пассивный просмотр кэша · записи могут быть устаревшими, полного списка нет.")
         return
-    # The raw dump may contain Wi-Fi configuration; only parsed fields are displayed.
-    dump = system_probe(["/system/bin/dumpsys", "-t", "8", "wifi"], root)
-    state, active = parse_softap(dump)
-    if state == "off":
-        print("Точка доступа выключена. Включи «Мобильная точка доступа» в настройках Android и повтори проверку.")
-    elif state == "unknown":
-        print("Не удалось надёжно определить состояние точки. Проверь его в настройках Android.")
-    else:
-        print("Точка доступа включена.")
-        for iface, count in sorted(active.items()):
-            suffix = f" · подключено по данным Android: {count}" if count is not None else ""
-            print(f"Интерфейс: {iface}{suffix}")
-            if count != 0:
-                print_neighbours(iface, root)
-        print("Адреса взяты из кэша этой точки и могут покрывать не всех клиентов.")
+    ap_print_status(ap_snapshot(root), False)
+
+
+AP_MAC = r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}"
+AP_ERRORS = (UserError, OSError, subprocess.SubprocessError)
+
+
+def ap_probe(argv, root):
+    try:
+        return system_probe(argv, root)
+    except AP_ERRORS:
+        return ""
+
+
+def ap_status(root):
+    if not Path("/system/bin/dumpsys").is_file():
+        return "unknown", {}
+    state, active = parse_softap(ap_probe(["/system/bin/dumpsys", "-t", "4", "wifi"], root))
+    if not active:
+        tether = ap_probe(["/system/bin/dumpsys", "-t", "4", "tethering", "--short"], root)
+        visible = dict.fromkeys(m[1] for m in re.finditer(
+            r"(?m)^[ \t]*((?:wlan|swlan|wifi|ap|softap)\d{1,3}) - (?:TetheredState|LocalHotspotState) -", tether))
+        if visible:
+            return "on", visible
+    return state, active
+
+
+def ap_settings():
+    am = "/system/bin/am"
+    if not Path(am).is_file():
+        raise UserError("Настройки точки доступа доступны только на Android.")
+    for action in ("com.android.settings.WIFI_TETHER_SETTINGS", "android.settings.TETHER_SETTINGS",
+                   "android.settings.WIRELESS_SETTINGS"):
+        try:
+            reply = system_probe([am, "start", "-a", action], False)
+            if not re.search(r"Error|unable to resolve|Exception", reply, re.I):
+                return
+        except AP_ERRORS:
+            continue
+    raise UserError("Android не открыл настройки. Открой «Мобильная точка доступа» вручную.")
+
+
+def ap_start():
+    if ap_status(True)[0] != "off":
+        raise UserError("Точка уже включена или её состояние неизвестно. Используй настройки Android.")
+    ssid = "Shark-" + secrets.token_hex(2).upper()
+    password = secrets.token_hex(7)
+    # Prefer Android's LocalOnlyHotspot when present. Neither shell path promises Internet tethering.
+    base = ["/system/bin/cmd", "wifi"]
+    help_text = ap_probe(base + ["help"], True)
+    action = "start-lohs" if re.search(r"(?m)^\s*start-lohs\s+<ssid>", help_text) else "start-softap"
+    system_probe(base + [action, ssid, "wpa2", password, "-b", "2"], True)
+    for attempt in range(4):
+        if ap_status(True)[0] == "on":
+            return ssid, password
+        if attempt < 3:
+            time.sleep(0.4)
+    raise UserError("Android не подтвердил запуск. Проверь состояние в настройках перед повтором.")
+
+
+def ap_interfaces(raw, active):
+    networks = {iface: [] for iface in active}
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] not in ("inet", "inet6"):
+            continue
+        iface = fields[1].split("@")[0]
+        if iface in networks:
+            try:
+                networks[iface].append(ipaddress.ip_interface(fields[3]))
+            except ValueError:
+                continue
+    return networks
+
+
+def ap_local_ip(raw):
+    try:
+        ip = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return None
+    if not (ip.is_unspecified or ip.is_loopback or ip.is_multicast):
+        return ip
+    return None
+
+
+def ap_hostname(raw):
+    value = case_text(raw, 64)
+    return value if value.casefold() not in ("null", "<unknown>", "unknown", "*", "-") else ""
+
+
+def ap_names(tether, leases, now):
+    names = {}
+    # Only explicit TYPE_WIFI client records are used (Android TETHERING_WIFI == 0).
+    # Some builds don't include client records in dumpsys at all.
+    for row in re.finditer(rf"TetheredClient\s*\{{hwAddr\s+({AP_MAC}),\s*addresses\s*\[([^\]]{{0,1800}})\]"
+                           r"\s*,\s*tetheringType\s+0\s*\}", tether):
+        for item in re.finditer(r"AddressInfo\s*\{([0-9A-Fa-f:.%]+)/(\d+),\s*hostname\s+([^}]{1,96})\}", row[2]):
+            ip, name = ap_local_ip(item[1]), ap_hostname(item[3])
+            if ip and name:
+                names[(row[1].lower(), str(ip))] = (name, "Android DHCP")
+    # Older Android can expose the actual dnsmasq lease file. Never use hostname without matching MAC+IP.
+    for line in leases.splitlines()[:1024]:
+        fields = line.split()
+        if len(fields) != 5 or not fields[0].isdecimal() or not re.fullmatch(AP_MAC, fields[1]):
+            continue
+        if len(fields[0]) > 12:
+            continue
+        expiry = int(fields[0])
+        ip, name = ap_local_ip(fields[2]), ap_hostname(fields[3])
+        if ip and name and (expiry == 0 or expiry > now):
+            names.setdefault((fields[1].lower(), str(ip)), (name, "аренда DHCP"))
+    return names
+
+
+def ap_neighbours(raw, iface, networks, names, count):
+    if count == 0:
+        return []
+    current = {str(entry.ip) for entry in networks}
+    rows = {}
+    for row in raw.splitlines():
+        parts = row.split()
+        if len(parts) < 4 or "lladdr" not in parts or "FAILED" in parts or "INCOMPLETE" in parts:
+            continue
+        state = next((p for p in reversed(parts) if p in ("REACHABLE", "STALE", "DELAY", "PROBE")), None)
+        if not state or ("dev" in parts and parts[parts.index("dev") + 1:parts.index("dev") + 2] != [iface]):
+            continue
+        mac = parts[parts.index("lladdr") + 1:parts.index("lladdr") + 2]
+        ip = ap_local_ip(parts[0])
+        if not ip or str(ip) in current or not mac or not re.fullmatch(AP_MAC, mac[0]):
+            continue
+        matching = next((entry for entry in networks if ip.version == entry.version and ip in entry.network), None)
+        if networks and not matching:
+            continue
+        key = mac[0].lower()
+        name, name_source = names.get((key, str(ip)), ("", ""))
+        rows[str(ip)] = {"ip": str(ip), "iface": iface, "state": state, "mac": key,
+                         "name": name, "name_source": name_source, "source": "кэш соседей Android",
+                         "network": str(matching.network) if matching else "",
+                         "gateway": str(matching.ip) if matching else ""}
+    # Clients with a matching, current Android lease but no neighbour cache entry are shown separately.
+    for (mac, raw_ip), (name, source) in names.items():
+        ip = ap_local_ip(raw_ip)
+        if not ip or raw_ip in current or raw_ip in rows:
+            continue
+        matching = next((entry for entry in networks if ip.version == entry.version and ip in entry.network), None)
+        if matching and count is not None and count > 0:
+            rows[raw_ip] = {"ip": raw_ip, "iface": iface, "state": "DHCP", "mac": mac, "name": name,
+                            "name_source": source, "source": "аренда, подключение не подтверждено",
+                            "network": str(matching.network), "gateway": str(matching.ip)}
+    return sorted(rows.values(), key=lambda row: (":" in row["ip"], int(ipaddress.ip_address(row["ip"]))))
+
+
+def ap_upstream(dump, carrier):
+    match = re.search(r"(?m)^\s*Current upstream interface\(s\):[^\S\n]*(.{1,240})$", dump)
+    if not match:
+        return ""
+    interfaces = set(re.findall(IFACE_NAME, match[1])) - {"null", "none", "None"}
+    if not interfaces:
+        return ""
+    if any(iface.startswith(("rmnet", "ccmni", "pdp", "wwan", "cell", "v4-rmnet")) for iface in interfaces):
+        operators = list(dict.fromkeys(case_text(p, 48) for p in carrier.strip().split(",") if case_text(p, 48)))
+        return "Сотовая сеть хотспота" + (" · Android сообщает: " + ", ".join(operators[:3]) if operators else "")
+    return "Внешний интерфейс хотспота · " + ", ".join(sorted(interfaces))
+
+
+def ap_snapshot(root):
+    state, active = ap_status(root)
+    data = {"state": state, "active": active, "upstream": "", "clients": []}
+    if state != "on":
+        return data
+    tether = ap_probe(["/system/bin/dumpsys", "-t", "4", "tethering", "--short"], root)
+    carrier = ""
+    if ap_upstream(tether, "").startswith("Сотовая"):
+        carrier = ap_probe(["/system/bin/getprop", "gsm.operator.alpha"], False)
+    tethered_ifaces = {m[1] for m in re.finditer(rf"(?m)^[ \t]*({IFACE_NAME}) - TetheredState -", tether)}
+    if tethered_ifaces.intersection(active):
+        data["upstream"] = ap_upstream(tether, carrier)
+    addresses = ap_probe(["/system/bin/ip", "-o", "address", "show"], root)
+    networks = ap_interfaces(addresses, active)
+    leases = ""
+    if root and not any("TetheredClient {hwAddr " in line for line in tether.splitlines()):
+        leases = ap_probe(["/system/bin/head", "-c", "65536", "/data/misc/dhcp/dnsmasq.leases"], True)
+    names = ap_names(tether, leases, time.time())
+    for iface, count in sorted(active.items()):
+        if count != 0:
+            raw = ap_probe(["/system/bin/ip", "neigh", "show", "dev", iface], root)
+            data["clients"].extend(ap_neighbours(raw, iface, networks[iface], names, count))
+    return data
+
+
+def ap_print_status(snapshot, as_json):
+    if as_json:
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return
+    print({"on": "Точка доступа включена.", "off": "Точка доступа выключена.",
+           "unknown": "Android не показал состояние точки доступа."}[snapshot["state"]])
+    if snapshot["upstream"]:
+        print(snapshot["upstream"])
+    for row in snapshot["clients"]:
+        print(f"  {row['ip']:39} {row['name'] or 'имя не сообщено'} · {row['state']}")
+    if snapshot["state"] == "on":
+        print("Показаны доступные записи, а не гарантированно все подключения.")
+
+
+def ap_card(client, upstream):
+    mac = client["mac"]
+    randomized = int(mac[:2], 16) & 2
+    return [
+        "IP · " + client["ip"],
+        "Устройство · " + (client["name"] or "имя не сообщено"),
+        "Интерфейс · " + client["iface"],
+        "Состояние · " + client["state"],
+        "Источник IP · " + client["source"],
+        "Источник имени · " + (client["name_source"] or "—"),
+        "MAC · " + mac + (" (локальный, возможно случайный)" if randomized else ""),
+        "Подсеть · " + (client["network"] or "—"),
+        "Адрес точки · " + (client["gateway"] or "—"),
+        "",
+        upstream or "Провайдер точки · неизвестен",
+        "Это сеть раздающего телефона, не оператор SIM клиента.",
+    ]
 
 
 def recent_clients(path, limit=1500):
@@ -1577,6 +1797,7 @@ CASE_MAX_BODY = 1536 * 1024
 CASE_SOCIAL = {
     "t.me": 1, "telegram.me": 1, "vk.com": 1, "instagram.com": 1, "facebook.com": 1,
     "youtube.com": 1, "tiktok.com": 1, "x.com": 1, "twitter.com": 1, "linkedin.com": 2,
+    "github.com": 1, "gitlab.com": 1, "codeberg.org": 1,
 }
 CASE_SOCIAL_RESERVED = {
     "share", "share.php", "intent", "login", "explore", "accounts", "reel", "reels",
@@ -2033,22 +2254,183 @@ def case_registry_name(name):
     return matches
 
 
+PROFILE_IMPORT_LIMIT = 512 * 1024
+
+
+def case_profile_key(url):
+    profile = case_profile(url)
+    if not profile:
+        return ""
+    parts = urlsplit(profile)
+    alias = {"twitter.com": "x.com"}.get(parts.hostname, parts.hostname)
+    return alias + parts.path.casefold()
+
+
+def case_import_profiles(path):
+    path = path.expanduser()
+    if path.suffix.casefold() not in (".csv", ".txt") or not path.is_file():
+        raise UserError("Для импорта укажи локальный отчёт CSV или TXT.")
+    with path.open("rb") as file:
+        raw = file.read(PROFILE_IMPORT_LIMIT + 1)
+    if len(raw) > PROFILE_IMPORT_LIMIT:
+        raise UserError("Отчёт профилей больше 512 КБ.")
+    text = raw.decode("utf-8-sig", "replace")
+    candidates = set()
+    if path.suffix.casefold() == ".txt":
+        records = ((line.strip(), "") for line in text.splitlines()[:2000])
+    else:
+        reader = csv.DictReader(io.StringIO(text))
+        columns = {name.strip().casefold(): name for name in reader.fieldnames or []}
+        # Sherlock and Maigret have url_user/exists. Blackbird has an exported URL column.
+        key = next((columns[k] for k in ("url_user", "url", "profile url", "profile_url", "link")
+                    if k in columns), None)
+        if not key:
+            raise UserError("В CSV нет столбца url_user или URL.")
+        records = ((row.get(key, ""), row.get(columns.get("exists", ""), ""))
+                   for row in itertools.islice(reader, 2000))
+    for url, status in records:
+        if status and status.strip().casefold() not in ("claimed", "found", "yes", "true", "exists"):
+            continue
+        if isinstance(url, str) and (key := case_profile_key(url.strip().strip("<>"))):
+            candidates.add(key)
+    return candidates
+
+
+WIKIDATA_COMPANIES = {"Q4830453", "Q783794", "Q167037", "Q6881511", "Q891723", "Q161726"}
+
+
+def case_wikidata_sites(name):
+    def wikidata(**params):
+        return case_json("https://www.wikidata.org/w/api.php?" + urlencode({"format": "json", **params}),
+                         headers={"User-Agent": f"PhoneHost/{VERSION} (https://github.com/zaoastronaftik-bit/phonehost)"})
+
+    language = "ru" if re.search(r"[А-Яа-яЁё]", name) else "en"
+    result = wikidata(action="wbsearchentities", search=name, language=language, type="item", limit=8)
+    rows = result.get("search")
+    if not isinstance(rows, list):
+        raise UserError("Wikidata не вернула результаты поиска.")
+    hits = {}
+    for row in map(case_dict, rows):
+        qid = case_text(row.get("id"), 12)
+        label = case_text(row.get("label"))
+        matched = case_text(case_dict(row.get("match")).get("text"))
+        if re.fullmatch(r"Q[1-9][0-9]{0,10}", qid) and any(case_key(v) == case_key(name)
+                                                         for v in (label, matched) if v):
+            hits[qid] = label
+    if not hits:
+        return []
+    entities = case_dict(wikidata(action="wbgetentities", ids="|".join(list(hits)[:4]), props="claims").get("entities"))
+
+    def values(claims, prop):
+        for claim in map(case_dict, case_list(claims.get(prop))[:20]):
+            if claim.get("rank") != "deprecated":
+                yield case_dict(case_dict(claim.get("mainsnak")).get("datavalue")).get("value")
+
+    sources = []
+    for qid, raw in entities.items():
+        if qid not in hits:
+            continue
+        claims = case_dict(case_dict(raw).get("claims"))
+        if not any(case_dict(c).get("id") in WIKIDATA_COMPANIES for c in values(claims, "P31")):
+            continue
+        for website in values(claims, "P856"):
+            try:
+                url = case_url(website)
+            except (ValueError, UnicodeError):
+                continue
+            if case_host(url) not in CASE_SOCIAL:
+                sources.append({"url": url, "source": "https://www.wikidata.org/wiki/" + qid,
+                                "name": hits[qid]})
+    return list({row["url"]: row for row in sources}.values())[:3]
+
+
+def case_org_accounts(handle):
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?", handle):
+        return [], []
+    accounts, failures = [], []
+    jobs = (
+        ("GitHub", "https://api.github.com/orgs/" + handle, "https://github.com/" + handle),
+        ("GitLab", "https://gitlab.com/api/v4/groups/" + handle, "https://gitlab.com/" + handle),
+    )
+    def lookup(job):
+        platform_name, endpoint, profile = job
+        try:
+            row = case_json(endpoint)
+        except UserError as exc:
+            return None, None if str(exc) == "HTTP 404" else f"{platform_name} · {exc}"
+        if platform_name == "GitHub":
+            if row.get("type") != "Organization" or case_text(row.get("login")).casefold() != handle:
+                return None, None
+        elif row.get("visibility") != "public" or case_text(row.get("full_path")).casefold() != handle:
+            return None, None
+        website = ""
+        if platform_name == "GitHub" and case_text(row.get("blog"), 900):
+            try:
+                target = case_url(row["blog"])
+                if case_host(target) not in CASE_SOCIAL:
+                    website = target
+            except (ValueError, UnicodeError):
+                pass
+        return {"platform": platform_name, "url": profile, "endpoint": endpoint,
+                "name": case_text(row.get("name"), 100), "website": website}, None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for account, failure in pool.map(lookup, jobs):
+            if account:
+                accounts.append(account)
+            if failure:
+                failures.append(failure)
+    return accounts, failures
+
+
+def case_account_links(report, accounts, imported):
+    published = {}
+    hosts = set()
+    for page in report["pages"]:
+        if "facts" not in page:
+            continue
+        hosts.add(case_host(page["url"]))
+        for kind, value in page["facts"]:
+            if kind == "profile" and (key := case_profile_key(value)):
+                published[key] = (value, page["url"])
+    for account in accounts:
+        match = published.get(case_profile_key(account["url"]))
+        if match:
+            account["link_state"] = "опубликован на сайте"
+            account["evidence"] = match[1]
+        elif account["website"] and case_host(account["website"]) in hosts:
+            account["link_state"] = "сам профиль ведёт на проверенный сайт"
+            account["evidence"] = account["website"]
+        else:
+            account["link_state"] = "публичная организация/группа; связь не подтверждена"
+    matches = []
+    for profile_key in sorted(imported.keys() & published.keys()):
+        url, source = published[profile_key]
+        matches.append({"url": url, "source": source, "reports": sorted(imported[profile_key])})
+    return matches
+
+
 def case_discovery(name, phone, handle):
     token = os.environ.get("PHONEHOST_BRAVE_KEY", "").strip()
     if not token:
         return [], "Веб-поиск не запущен · настрой PHONEHOST_BRAVE_KEY или укажи сайт."
-    terms = ['"' + value.replace('"', '') + '"' for value in (name, phone, handle) if value]
+    alternatives = [name, phone, handle]
+    if phone.startswith("+371") and len(phone) == 12:
+        alternatives.append(f"+371 {phone[4:8]} {phone[8:]}")
+    elif phone.startswith("+7") and len(phone) == 12:
+        alternatives.append(f"+7 {phone[2:5]} {phone[5:8]}-{phone[8:10]}-{phone[10:]}")
+    terms = ['"' + value.replace('"', '') + '"' for value in dict.fromkeys(alternatives) if value]
     if not terms:
         return [], "Для веб-поиска укажи название компании, рабочий телефон или деловой @ник."
-    query = ("(" + " OR ".join(terms) + ")" if len(terms) > 1 else terms[0]) + " (contact OR контакты OR kontakti)"
+    query = "(" + " OR ".join(terms) + ")" if len(terms) > 1 else terms[0]
     data = case_json("https://api.search.brave.com/res/v1/web/search?" + urlencode({
-        "q": query, "count": 10, "country": "ALL",
+        "q": query, "count": 16, "country": "ALL",
     }), headers={"X-Subscription-Token": token})
     rows = case_dict(data.get("web")).get("results", [])
     if not isinstance(rows, list):
         raise UserError("веб-поиск не вернул список страниц")
     results = {}
-    for row in map(case_dict, rows[:10]):
+    for row in map(case_dict, rows[:16]):
         try:
             url = case_url(row.get("url", ""))
         except (ValueError, UnicodeError):
@@ -2056,7 +2438,7 @@ def case_discovery(name, phone, handle):
         host = case_host(url)
         if host not in CASE_SOCIAL:
             results.setdefault(host, url)
-    return list(results.values())[:4], None
+    return list(results.values())[:6], None
 
 
 def case_key(value):
@@ -2148,12 +2530,28 @@ def case_collect(opts):
         if not report["bill"]:
             report["notes"].append("В локальном счёте не распознаны телефон или регистрационный номер.")
 
+    reports = opts.profile_report or []
+    if len(reports) > 5:
+        raise UserError("За один раз можно добавить до пяти отчётов профилей.")
+    imported = {}
+    for path in reports:
+        for key in case_import_profiles(path):
+            imported.setdefault(key, set()).add(case_text(path.name, 96))
+
     def collect(url, supplied):
         try:
             actual, html = case_html(url)
-            facts, extra = case_evidence(actual, html, case_phone_region(country, phone, actual),
-                                         supplied=supplied)
-            if supplied or (any(k == "organization" for k, _ in facts) and case_match(facts, name, phone, handle)):
+            page_region = case_phone_region(country, phone, actual)
+            facts, extra = case_evidence(actual, html, page_region, supplied=supplied)
+            looks_business = any(k == "organization" for k, _ in facts)
+            if not supplied and not (looks_business and case_match(facts, name, phone, handle)):
+                # Plain HTML is eligible only with an explicitly labelled company identifier
+                # and a matching business input. Search snippets alone aren't evidence.
+                more, _ = case_evidence(actual, html, page_region, supplied=True)
+                looks_business = any(k == "identifier" for k, _ in more)
+                if looks_business:
+                    facts = more
+            if supplied or (looks_business and case_match(facts, name, phone, handle)):
                 return {"url": actual, "source": "supplied" if supplied else "discovered",
                         "facts": [list(f) for f in facts[:90]]}, extra
         except (UserError, OSError, ValueError, http.client.HTTPException) as exc:
@@ -2177,9 +2575,10 @@ def case_collect(opts):
             if note:
                 report["notes"].append(note)
             tested = {case_host(p["url"]) for p in report["pages"]}
-            for url in candidates:
-                if case_host(url) not in tested:
-                    add_page(collect(url, False)[0])
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                for page, _ in pool.map(lambda url: collect(url, False),
+                                        [url for url in candidates if case_host(url) not in tested]):
+                    add_page(page)
             if candidates and not any(p["source"] == "discovered" for p in report["pages"]):
                 report["notes"].append("Веб-поиск не подтвердил дополнительных деловых страниц.")
             if not candidates and not note:
@@ -2188,6 +2587,23 @@ def case_collect(opts):
             report["notes"].append(f"Веб-поиск недоступен · {exc}.")
     elif not sites and (name or phone or handle):
         report["notes"].append("Для проверки контактов добавь сайт или включи веб-поиск.")
+    if name and opts.profiles and not any("facts" in page for page in report["pages"]):
+        try:
+            report["wikidata_sites"] = case_wikidata_sites(name)
+            for item in report["wikidata_sites"]:
+                add_page(collect(item["url"], False)[0])
+        except UserError as exc:
+            report["notes"].append(f"Wikidata недоступна · {exc}.")
+    if handle and opts.profiles:
+        report["org_accounts"], failures = case_org_accounts(handle)
+        if failures:
+            report["notes"].extend(f"Источник профилей недоступен · {message}." for message in failures)
+        if not report["org_accounts"] and not failures:
+            report["notes"].append("GitHub и GitLab не вернули публичную организацию или группу по этому нику.")
+    if reports or "org_accounts" in report:
+        report["profile_matches"] = case_account_links(report, report.get("org_accounts", []), imported)
+        if reports and not report["profile_matches"]:
+            report["notes"].append("В импортированных отчётах нет ссылок, подтверждённых публикациями на проверенных сайтах.")
     bill_ids = [value for kind, value in report.get("bill", []) if kind == "identifier"]
     identifiers = list(dict.fromkeys((([number] if number else []) + bill_ids) + sorted({
         value for p in report["pages"] for kind, value in p.get("facts", []) if kind == "identifier"
@@ -2286,6 +2702,18 @@ def case_present(report):
             print(f"    {CASE_LABELS[kind]} · {value}{marker}")
     if not report["pages"]:
         print("  Подтверждённых публикаций нет в пределах этой проверки.")
+    if report.get("wikidata_sites"):
+        print("\nСАЙТЫ-КАНДИДАТЫ ИЗ WIKIDATA · не выписка из реестра")
+        for item in report["wikidata_sites"]:
+            print(f"  {item['name']} · {item['url']} · {item['source']}")
+    if report.get("org_accounts") or report.get("profile_matches"):
+        print("\nПУБЛИЧНЫЕ ПРОФИЛИ")
+        for item in report.get("org_accounts", []):
+            print(f"  {item['platform']} · {item['name'] or '—'} · {item['url']}")
+            print(f"    {item['link_state']} · {item.get('evidence', item['endpoint'])}")
+        for item in report.get("profile_matches", []):
+            print(f"  {item['url']} · {', '.join(item['reports'])}")
+            print(f"    Опубликован на проверенной странице · {item['source']}")
     if report.get("bill"):
         print("\nЛОКАЛЬНЫЙ СЧЁТ · распознано, не подтверждено")
         for kind, value in report["bill"]:
@@ -2423,7 +2851,7 @@ class SharkConsole:
                 pass
             except KeyboardInterrupt:
                 self.result("Отменено", ("Действие остановлено.",), 130)
-            except (UserError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            except (UserError, OSError, subprocess.SubprocessError, ValueError, KeyError, csv.Error) as exc:
                 self.result("Ошибка", (clean(str(exc)),), 1)
 
     def result(self, title, lines, code=0):
@@ -2505,6 +2933,98 @@ class SharkConsole:
 
     def path(self):
         return str(Path(self.prompt("Путь к файлу")).expanduser())
+
+    def hotspot(self):
+        title = "Точка доступа / Shark"
+        root = self.root_network
+        notice = ""
+        credentials = None
+        page = 0
+        snapshot = ap_snapshot(root)
+        while True:
+            clients = snapshot["clients"]
+            height = shutil.get_terminal_size((54, 24)).lines
+            span = max(1, min(8, height - 15))
+            pages = max(1, (len(clients) + span - 1) // span)
+            page = min(page, pages - 1)
+            shown = clients[page * span:(page + 1) * span]
+            label = {"off": "Выключена", "on": "Включена", "unknown": "Статус недоступен"}
+            lines = ["● " + label[snapshot["state"]] + (" · root" if root else "")]
+            if snapshot["upstream"]:
+                lines.append(snapshot["upstream"])
+            if credentials and snapshot["state"] == "on":
+                lines += [f"Wi-Fi · {credentials[0]}", f"Пароль · {credentials[1]}"]
+            counts = list(snapshot["active"].values())
+            if counts and None not in counts:
+                lines.append(f"По данным Android · устройств {sum(counts)}")
+            lines += [f"Видимых адресов · {len(clients)}", ""]
+            for idx, client in enumerate(shown, 1):
+                name = client["name"] or "без имени"
+                lines.append(f" {idx}. {client['ip']} · {name}")
+            if not clients and snapshot["state"] == "on":
+                lines.append("Android пока не показал адреса клиентов.")
+            if pages > 1:
+                lines.append(f" {page + 1}/{pages} · n дальше · p назад")
+            lines += [" a  Включить локальную точку (root)",
+                      " s  Раздача интернета / настройки Android",
+                      " i  Внешний IP телефона и его сеть",
+                      " r  Обновить    0  Назад"]
+            if not root:
+                lines.append(" v  Читать данные Android через root")
+            if notice:
+                lines.append(notice)
+            self.frame(title, lines)
+            print("  › ", end="", flush=True)
+            if self.full and os.name == "posix":
+                # No background scans: just refresh the current Android snapshot while the panel is open.
+                while not select.select([sys.stdin], [], [], 6)[0]:
+                    fresh = ap_snapshot(root)
+                    if fresh != snapshot:
+                        if fresh["state"] == "off":
+                            credentials = None
+                        snapshot = fresh
+                        break
+                else:
+                    fresh = None
+                if fresh is not None:
+                    continue
+            line = sys.stdin.readline()
+            if not line:
+                return
+            key = line.strip().casefold()
+            notice = ""
+            if key in ("0", "q"):
+                return
+            if key == "n" and page + 1 < pages:
+                page += 1
+                continue
+            if key == "p" and page > 0:
+                page -= 1
+                continue
+            if len(key) == 1 and key in "12345678" and int(key) <= len(shown):
+                client = shown[int(key) - 1]
+                self.result("Карточка IP", ap_card(client, snapshot["upstream"]))
+            elif key == "s":
+                ap_settings()
+            elif key == "i":
+                self.job("Внешний IP телефона", "_console-view", "ap-public")
+            elif key == "a":
+                if snapshot["state"] == "on":
+                    notice = "Точка уже включена."
+                else:
+                    self.frame(title, ("Android запускает защищённую локальную точку…",))
+                    try:
+                        credentials = ap_start()
+                        root = True
+                    except AP_ERRORS as exc:
+                        notice = case_text(str(exc), 240) + " Клавиша s открывает настройки."
+            elif key == "v":
+                root = True
+            elif key not in ("r", ""):
+                notice = "Введи номер IP или команду из меню."
+            snapshot = ap_snapshot(root)
+            if snapshot["state"] == "off":
+                credentials = None
 
     def inventory(self, mode):
         title = "Текущий Wi-Fi" if mode == "wifi" else "Своя точка доступа"
@@ -2589,6 +3109,11 @@ class SharkConsole:
         bill = input("  Путь к счёту TXT / фото [необязательно] › ").strip()
         if bill:
             args.append(f"--bill={bill}")
+        profile_report = input("  CSV Blackbird / Sherlock / Maigret [необязательно] › ").strip()
+        if profile_report:
+            args.append(f"--profile-report={profile_report}")
+        if any(arg.startswith(("--handle=", "--company=")) for arg in args):
+            args.append("--profiles")
         if not args:
             return
         if os.environ.get("PHONEHOST_BRAVE_KEY", "").strip():
@@ -2613,7 +3138,7 @@ class SharkConsole:
         try:
             self.pick("Пульт управления", (
                 ("Текущий Wi-Fi", lambda: self.inventory("wifi")),
-                ("Своя точка доступа", lambda: self.inventory("hotspot")),
+                ("Точка доступа · запуск и клиенты", self.hotspot),
                 ("Быстрый сервер · IP и пароль", lambda: self.job("Быстрый сервер", "quick-server")),
                 ("Управление сервером", self.servers),
                 ("Коробки Debian", self.boxes),
@@ -2630,6 +3155,7 @@ class SharkConsole:
 def console_view(argv):
     views = {
         "local": (0, local_network), "public": (0, public_address), "clients": (0, show_clients),
+        "ap-public": (0, ap_public_provider),
         "leases": (1, lambda path: show_leases(Path(path))),
         "subnet": (1, subnet_info), "reverse": (1, reverse_dns), "tls": (1, check_tls),
         "format": (1, lambda path: inspect_file(Path(path))),
@@ -2681,8 +3207,14 @@ def main(argv):
     p.add_argument("--registration", help="ИНН юрлица, ОГРН, регистрационный номер LV или LEI")
     p.add_argument("--bill", type=Path, help="сверить реквизиты локального счёта в TXT или фото")
     p.add_argument("--discover", action="store_true", help="искать деловые страницы через Brave с API-ключом")
+    p.add_argument("--profiles", action="store_true", help="проверить публичные организации GitHub/GitLab и сайты компаний из Wikidata")
+    p.add_argument("--profile-report", type=Path, action="append", help="сверить локальный CSV Blackbird, Sherlock или Maigret")
     p.add_argument("--case", help="имя локальной истории для сравнения проверок")
     p.add_argument("--json", action="store_true", help="вывести структурированный JSON-отчёт")
+    p = sub.add_parser("hotspot", help="открыть настройки или посмотреть клиентов своей точки доступа")
+    p.add_argument("action", choices=("status", "settings", "start"), default="status", nargs="?")
+    p.add_argument("--root", action="store_true", help="читать привилегированные системные данные через su")
+    p.add_argument("--json", action="store_true", help="JSON-снимок для команды status")
     p = sub.add_parser("network", help="посмотреть текущий Wi-Fi или свою точку доступа")
     p.add_argument("kind", choices=("wifi", "hotspot"))
     p.add_argument("--root", action="store_true", help="только чтение системных данных через su")
@@ -2760,6 +3292,14 @@ def main(argv):
         SharkConsole(opts.root_network).run()
     elif opts.cmd == "investigate":
         case_investigate(opts)
+    elif opts.cmd == "hotspot":
+        if opts.action == "settings":
+            ap_settings()
+        elif opts.action == "start":
+            ssid, password = ap_start()
+            print(f"Точка запущена · {ssid}\nПароль · {password}\nРаздача интернета не подтверждена.")
+        else:
+            ap_print_status(ap_snapshot(opts.root), opts.json)
     elif opts.cmd == "network":
         network_inventory(opts.kind, opts.root)
     elif opts.cmd == "quick-server":
@@ -2801,7 +3341,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         main(sys.argv[1:])
-    except (UserError, OSError, subprocess.SubprocessError, ValueError) as exc:
+    except (UserError, OSError, subprocess.SubprocessError, ValueError, csv.Error) as exc:
         print(f"PhoneHost: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
@@ -2812,7 +3352,7 @@ PHONEHOST_PY
 chmod 700 "$launcher"
 mv -f -- "$launcher" "$PREFIX/bin/phonehost"
 if [ "$#" -eq 1 ] && [ "$1" = "--launcher-only" ]; then
-  printf '\nPhoneHost 0.6 · команда обновлена. Открой панель: phonehost console\n'
+  printf '\nPhoneHost 0.7 · команда обновлена. Открой панель: phonehost console\n'
   exit 0
 fi
 export PHONEHOST_BOOTSTRAP_SECS="$SECONDS"
